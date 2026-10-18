@@ -8,6 +8,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <semaphore>
+#include <thread>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -29,7 +31,8 @@ REXCVAR_DEFINE_STRING(dump_resolves, "", "Blitz",
                       "destination is read back to <prefix>-f<frame>-<n>.res (tools/compare_resolves.py)");
 
 REXCVAR_DEFINE_STRING(native_shader_dir, "", "Blitz",
-                      "Directory with the translated shaders (<container>.dxil)");
+                      "Directory with the translated shaders (<container>.dxil); shaders missing there "
+                      "are translated at first use and saved there");
 
 namespace blitz {
 
@@ -57,6 +60,68 @@ ID3D12DescriptorHeap* CreateHeap(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYP
   ID3D12DescriptorHeap* heap = nullptr;
   device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap));
   return heap;
+}
+
+// Runs a tool without a console window, below the game's priority. True if it exits with 0.
+bool RunTool(std::wstring command) {
+  STARTUPINFOW startup = {sizeof(startup)};
+  PROCESS_INFORMATION process = {};
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &startup, &process))
+    return false;
+  DWORD code = 1;
+  if (WaitForSingleObject(process.hProcess, 120000) == WAIT_OBJECT_0)
+    GetExitCodeProcess(process.hProcess, &code);
+  else
+    TerminateProcess(process.hProcess, 1);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return code == 0;
+}
+
+// What tools/translate_shaders.py does for one container: save it as
+// <name>.xsc, translate it with XenosRecomp, compile with dxc (as a library if
+// it uses specialization constants), and return the DXIL, also saved as
+// <name>.dxil. Empty on failure (dxc's messages stay in <name>.dxc.log).
+std::vector<uint8_t> TranslateShader(const std::filesystem::path& dir, const std::string& name,
+                                     const std::string& container) {
+  // A few at a time, so a burst of new shaders leaves the game its cores.
+  static std::counting_semaphore<> slots(std::max(1u, std::thread::hardware_concurrency() / 4));
+  slots.acquire();
+  const auto start = std::chrono::steady_clock::now();
+  const auto file = [&](const char* extension) { return dir / (name + extension); };
+  const auto quote = [](const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; };
+  std::ofstream(file(".xsc"), std::ios::binary).write(container.data(), container.size());
+  bool ok = RunTool(quote(BLITZ_XENOS_RECOMP) + L" " + quote(file(".xsc")) + L" " + quote(file(".hlsl")) +
+                    L" " + quote(BLITZ_SHADER_COMMON));
+  const wchar_t* target = L"";
+  if (ok) {
+    // Written under a temporary name so an interrupted compile never leaves a bad cache entry.
+    for (const wchar_t* t : {name.ends_with(".vs") ? L"vs_6_0" : L"ps_6_0", L"lib_6_3"}) {
+      target = t;
+      ok = RunTool(quote(BLITZ_DXC) + L" -T " + t +
+                   L" -HV 2021 -all-resources-bound -Wno-ignored-attributes -Qstrip_reflect -Qstrip_debug -Fo " +
+                   quote(file(".dxil.tmp")) + L" -Fe " + quote(file(".dxc.log")) + L" " + quote(file(".hlsl")));
+      if (ok) break;
+    }
+  }
+  std::error_code error;
+  if (ok) std::filesystem::rename(file(".dxil.tmp"), file(".dxil"), error);
+  std::vector<uint8_t> dxil;
+  if (ok && !error) {
+    std::ifstream in(file(".dxil"), std::ios::binary);
+    dxil.assign(std::istreambuf_iterator<char>(in), {});
+    std::filesystem::remove(file(".dxc.log"), error);
+  }
+  slots.release();
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  if (dxil.empty())
+    REXLOG_WARN("native_renderer: could not translate shader {} ({:.1f} s): {}", name, seconds,
+                *target ? "dxc failed, see " + file(".dxc.log").string() : std::string("XenosRecomp failed"));
+  else
+    REXLOG_INFO("native_renderer: translated shader {} ({}, {:.1f} s)", name,
+                std::filesystem::path(target).string(), seconds);
+  return dxil;
 }
 
 }  // namespace
@@ -363,13 +428,24 @@ void NativeRenderer::Skip(const std::string& reason) {
 
 void NativeRenderer::EndFrame(uint32_t frontbuffer, uint8_t* base) {
   ++frames_;
+  const auto now = std::chrono::steady_clock::now();
+  if (last_present_ != std::chrono::steady_clock::time_point{}) {
+    const double ms = std::chrono::duration<double, std::milli>(now - last_present_).count();
+    frame_ms_sum_ += ms;
+    frame_ms_max_ = std::max(frame_ms_max_, ms);
+    slow_frames_ += ms > 25.0;
+  }
+  last_present_ = now;
   if (frames_ % 600 == 0) {
     std::string reasons;
     for (auto& [reason, count] : skip_reasons_) reasons += " [" + reason + ": " + std::to_string(count) + "]";
     REXLOG_INFO("native_renderer: {} frames, {} draws, {} skipped{}; {} pipelines, {} targets; uploads {} MB "
-                "(largest frame {} MB)", frames_, draws_, skipped_, reasons, pipelines_.size(), targets_.size(),
-                upload_bytes_ >> 20, max_frame_upload_bytes_ >> 20);
+                "(largest frame {} MB); frame time avg {:.2f} ms, max {:.1f} ms, {} over 25 ms", frames_, draws_,
+                skipped_, reasons, pipelines_.size(), targets_.size(), upload_bytes_ >> 20,
+                max_frame_upload_bytes_ >> 20, frame_ms_sum_ / 600, frame_ms_max_, slow_frames_);
     upload_bytes_ = max_frame_upload_bytes_ = 0;
+    frame_ms_sum_ = frame_ms_max_ = 0;
+    slow_frames_ = 0;
   }
   TextureCache::Entry* front = nullptr;
   if (frontbuffer) {
@@ -467,7 +543,11 @@ NativeRenderer::Shader* NativeRenderer::ShaderFor(uint32_t object, uint8_t* base
       shader->dxil.assign(std::istreambuf_iterator<char>(file), {});
       shader->loaded = !shader->dxil.empty();
     }
-    if (!shader->loaded) REXLOG_WARN("native_renderer: no translated shader {}", name);
+    if (!shader->loaded && !REXCVAR_GET(native_shader_dir).empty()) {
+      REXLOG_INFO("native_renderer: no translated shader {}; translating it", name);
+      shader->translating = std::async(std::launch::async, TranslateShader,
+                                       std::filesystem::path(REXCVAR_GET(native_shader_dir)), name, container);
+    }
   }
   shader_objects_[object] = shader.get();
   return shader.get();

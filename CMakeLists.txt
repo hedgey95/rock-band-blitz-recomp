@@ -45,6 +45,7 @@ set(BLITZ_SOURCES
 file(GLOB _blitz_dxc "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64/dxc.exe")
 list(SORT _blitz_dxc)
 list(GET _blitz_dxc -1 BLITZ_DXC)
+file(TO_CMAKE_PATH "${BLITZ_DXC}" BLITZ_DXC)  # forward slashes: it is also a C string (renderer.cpp)
 set(BLITZ_SHADER_HEADERS "")
 foreach(_shader present_cs resolve_depth_cs resolve_depth_ms_cs)
     set(_out "${CMAKE_CURRENT_BINARY_DIR}/shaders/${_shader}.h")
@@ -67,6 +68,13 @@ endif()
 rexglue_setup_target(blitz)
 target_link_libraries(blitz PRIVATE dbghelp)
 target_include_directories(blitz PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")  # shaders/*.h
+# Runtime translation of shaders missing from --native_shader_dir (renderer.cpp)
+# uses the same tools as tools/translate_shaders.py.
+# shortcut: build-machine paths, so only dev builds translate; bundle the tools when packaging.
+target_compile_definitions(blitz PRIVATE
+    BLITZ_DXC="${BLITZ_DXC}"
+    BLITZ_XENOS_RECOMP="${CMAKE_CURRENT_SOURCE_DIR}/out/build/xenos_recomp/XenosRecomp/XenosRecomp.exe"
+    BLITZ_SHADER_COMMON="${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/XenosRecomp/XenosRecomp/shader_common.h")
 
 # Stock Xenia GPU plugin, kept only as the reference renderer while the native
 # one is built. Loaded at runtime with --gpu_plugin=xenos.

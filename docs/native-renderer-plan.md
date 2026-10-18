@@ -273,3 +273,46 @@ Open after N5:
 - Uploads: streams go up whole, once per frame each, about 15 MB per frame.
 - First-time costs (pipelines, texture decode) make loading run at 17–38 fps;
   the song itself holds 60.
+
+## Runtime shader translation (2026-10-18)
+
+A shader missing from `--native_shader_dir` no longer leaves its draws out for
+the whole run (the blue screen with only the HUD at section endings). At its
+first bind, `NativeRenderer::ShaderFor` (`src/renderer/renderer.cpp`) starts a
+worker thread that does what `tools/translate_shaders.py` does for one shader:
+it saves the container as `<name>.xsc` in the shader dir, runs XenosRecomp,
+then `dxc` (`vs_6_0`/`ps_6_0`, then `lib_6_3`), and saves `<name>.dxil`
+(written as `.dxil.tmp` and renamed, so an interrupted compile leaves no bad
+file). Draws that use the shader are skipped as "shader still translating"
+until it is ready; then the first draw after that picks it up. Tools run with
+no console window, below normal priority, at most a quarter of the cores at a
+time. Log lines: `no translated shader <name>; translating it`, then
+`translated shader <name> (<target>, <s> s)` or `could not translate ...`
+(dxc's messages stay in `<name>.dxc.log`).
+
+The tool paths are compiled in from the build machine (CMakeLists.txt:
+XenosRecomp from `out/build/xenos_recomp`, `shader_common.h` from the
+submodule, `dxc` from the Windows SDK), so only dev builds can translate. A
+release needs those tools shipped with the exe.
+
+Measured on the One Week mash tape (real time, no frame lock):
+- **Regeneration.** 7 shaders (2 VS, 5 PS; title and gameplay) deleted from
+  a copy of the shader dir (`rbb-gamedata/shader-hlsl-rt-test`). The run
+  translated all 7 in 0.1–0.4 s each, skipping 53 draws while they compiled
+  (2 at the title, 37 at the song start, 14 later), with no other new skips.
+  The regenerated `.hlsl` and `.dxil` are byte-identical to the offline set.
+  A second run on that dir translated nothing and skipped only the 3 boot
+  draws, as the full set does.
+- **Frame times** (present to present, now in the 600-frame log line), two
+  runs each with the full shader set: mean after boot 16.78/16.79 ms before,
+  16.79/16.79 ms after; frames over 25 ms 240/242 before, 249/250 after (the
+  new exe ranged 242–257 over four runs, so the gap is within run-to-run
+  variance). Translating 7 shaders mid-run added no slow frames to its windows.
+- **N5 gate.** `gate-n5.ps1` failed twice after this change, both times at
+  frame +1200 with 1.04% bad pixels, and both times the two runs found their
+  first 3D frame 2 frames apart (stock 2883 / native 2885, then 2885 / 2883).
+  Paired by equal first 3D frames, the same captures pass 11/11 (worst 0.63%),
+  and the new native frames match the pre-change native frames (gate6, 13:04)
+  within 0.03%. So the renderer is unchanged; the gate's alignment is flaky
+  when the start frames differ (something on screen is not counted from the
+  first 3D frame).

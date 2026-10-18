@@ -298,7 +298,18 @@ void NativeRenderer::DoDraw(const Draw& draw, uint8_t* base) {
   if (edram_mode != 4 && edram_mode != 5) return Skip("EDRAM mode " + std::to_string(edram_mode));
   Shader* vs = ShaderFor(bound_vs_, base);
   Shader* ps = ShaderFor(bound_ps_, base);
-  if (!vs || !ps || !vs->loaded || !ps->loaded) return Skip("shader not translated");
+  // A shader translated on a worker thread (ShaderFor) is used from the first draw after it is done.
+  auto ready = [](Shader* shader) {
+    if (shader && shader->translating.valid() &&
+        shader->translating.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+      shader->dxil = shader->translating.get();
+      shader->loaded = !shader->dxil.empty();
+    }
+    return shader && shader->loaded;
+  };
+  if (!ready(vs) || !ready(ps))
+    return Skip((vs && vs->translating.valid()) || (ps && ps->translating.valid()) ? "shader still translating"
+                                                                                   : "shader not translated");
   if (vs_code_.empty()) return Skip("no vertex shader microcode");
 
   auto& fetches = fetches_[{vs->name, vs_code_hash_}];

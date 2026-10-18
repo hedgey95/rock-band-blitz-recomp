@@ -4,7 +4,8 @@
 // - the dirty-state flushes are replayed into a register file, which is
 //   exactly what the GPU would see (docs/d3d-device-map.md);
 // - shaders come from XenosRecomp, as DXIL files named by container
-//   (--native_shader_dir, from tools/translate_shaders.py);
+//   (--native_shader_dir, from tools/translate_shaders.py); one missing there is
+//   translated on a worker thread at its first bind and saved there;
 // - every draw call becomes a D3D12 draw with a pipeline built from the
 //   registers, vertex/index data rebuilt for the host, and textures from the
 //   texture cache;
@@ -14,8 +15,10 @@
 // which waits for the GPU (simple and correct first; milestone 4 measures).
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <string>
@@ -58,6 +61,7 @@ class NativeRenderer final : public d3d::Listener {
     std::vector<uint8_t> dxil;
     std::vector<VertexElement> elements;
     bool loaded = false;
+    std::future<std::vector<uint8_t>> translating;  // DXIL, empty if translation failed
   };
   struct RenderTarget {
     ID3D12Resource* resource = nullptr;
@@ -212,6 +216,10 @@ class NativeRenderer final : public d3d::Listener {
   uint64_t frames_ = 0, draws_ = 0, skipped_ = 0;
   uint64_t upload_bytes_ = 0, frame_upload_bytes_ = 0, max_frame_upload_bytes_ = 0;
   std::map<std::string, uint64_t> skip_reasons_;
+  // Present-to-present times over the same 600 frames (milestone 4).
+  std::chrono::steady_clock::time_point last_present_{};
+  double frame_ms_sum_ = 0, frame_ms_max_ = 0;
+  uint32_t slow_frames_ = 0;  // over 1.5 vblanks (25 ms)
   void Skip(const std::string& reason);
 };
 
