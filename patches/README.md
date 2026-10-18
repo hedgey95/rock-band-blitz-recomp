@@ -178,6 +178,20 @@ alternate title IDs; that is how it plays your Rock Band song packages.
   but opened under the profile's folder, so it fails to open. Real DLC is
   type 2 (always common) and customs go through the custom-songs folder.
 
+## 12. Playback device (`src/audio/sdl/sdl_audio_driver.cpp`)
+
+Windows makes a USB DualSense (or DualShock 4) the default output when it is
+plugged in, so the game played on the pad's speaker. Now:
+- `--audio_device=<part of a name>` (case-insensitive) opens that device.
+- Otherwise the system default, unless its name contains "DualSense" or
+  "Wireless Controller": then the first other playback device. A name that
+  matches nothing logs a warning and falls back to this.
+- Checked with the pad as the Windows default: no option → Realtek speakers;
+  `--audio_device=nosuchdevice` → Realtek; `--audio_device=dualsense` → the pad.
+- With no option and no controller default, the game still opens SDL's default
+  device, which follows Windows' default mid-game. A device picked by name or
+  by skipping the pad stays put.
+
 # XenosRecomp patch
 
 `thirdparty/XenosRecomp` is a submodule pinned to hedge-dev/XenosRecomp

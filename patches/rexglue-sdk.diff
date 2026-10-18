@@ -178,10 +178,20 @@ index 7a711a8..293849c 100644
        rex::thread::Sleep(std::chrono::milliseconds(500));
      }
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..22795cc 100644
+index 20a2cd8..734108c 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
-@@ -18,6 +18,10 @@
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cctype>
++#include <string>
++#include <string_view>
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
+@@ -18,6 +21,10 @@
  #include <rex/audio/downmix.h>
  #include <rex/audio/flags.h>
  #include <rex/audio/sdl/sdl_audio_driver.h>
@@ -192,10 +202,13 @@ index 20a2cd8..22795cc 100644
  #include <rex/cvar.h>
  #include <rex/dbg.h>
  #include <rex/logging.h>
-@@ -25,8 +29,58 @@
+@@ -25,8 +32,61 @@
  #include <SDL3/SDL.h>
  
  REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_STRING(audio_device, "", "Audio",
++                      "Playback device: any part of its name (case-insensitive); default: the "
++                      "system default, unless that is a game controller's speaker");
 +REXCVAR_DEFINE_BOOL(audio_frame_clock, false, "Audio",
 +                    "Dev: play audio (silently) at 1/60 s per presented frame instead of the "
 +                    "device's pace, so games timed by audio advance with frames (deterministic tests)");
@@ -251,7 +264,86 @@ index 20a2cd8..22795cc 100644
  
  SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
      : AudioDriver(memory), semaphore_(semaphore) {}
-@@ -106,6 +160,10 @@ bool SDLAudioDriver::Initialize() {
+@@ -36,6 +96,51 @@ SDLAudioDriver::~SDLAudioDriver() {
+   assert_true(frames_unused_.empty());
+ }
+ 
++static bool NameContains(const char* name, std::string_view part) {
++  if (!name) return false;
++  auto lower = [](std::string_view v) {
++    std::string out(v);
++    for (char& c : out) c = char(std::tolower(static_cast<unsigned char>(c)));
++    return out;
++  };
++  return lower(name).find(lower(part)) != std::string::npos;
++}
++
++// Windows makes a USB DualSense (or DualShock 4) the default output when it
++// is plugged in, and nobody wants the game on the pad's speaker.
++static bool IsControllerSpeaker(const char* name) {
++  return NameContains(name, "DualSense") || NameContains(name, "Wireless Controller");
++}
++
++// --audio_device if it matches a device; otherwise the system default, or the
++// first other device when the default is a controller's speaker.
++static SDL_AudioDeviceID ChoosePlaybackDevice() {
++  int count = 0;
++  SDL_AudioDeviceID* devices = SDL_GetAudioPlaybackDevices(&count);
++  SDL_AudioDeviceID chosen = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
++  const std::string wanted = REXCVAR_GET(audio_device);
++  if (!wanted.empty()) {
++    for (int i = 0; i < count && chosen == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK; ++i)
++      if (NameContains(SDL_GetAudioDeviceName(devices[i]), wanted)) chosen = devices[i];
++    if (chosen == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK)
++      REXAPU_WARN("--audio_device '{}' matches no playback device; using the default", wanted);
++  }
++  if (chosen == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) {
++    // A logical device opened on the default reports the physical device's name.
++    const SDL_AudioDeviceID probe = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
++    const bool controller = probe && IsControllerSpeaker(SDL_GetAudioDeviceName(probe));
++    if (probe) SDL_CloseAudioDevice(probe);
++    for (int i = 0; controller && i < count; ++i) {
++      if (!IsControllerSpeaker(SDL_GetAudioDeviceName(devices[i]))) {
++        chosen = devices[i];
++        break;
++      }
++    }
++  }
++  SDL_free(devices);
++  return chosen;
++}
++
+ bool SDLAudioDriver::Initialize() {
+   // Set audio category for proper OS audio handling
+   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+@@ -49,14 +154,14 @@ bool SDLAudioDriver::Initialize() {
+   }
+   sdl_initialized_ = true;
+ 
++  const SDL_AudioDeviceID playback_device = ChoosePlaybackDevice();
+   SDL_AudioSpec desired_spec = {};
+   SDL_AudioSpec obtained_spec = {};
+   desired_spec.freq = frame_frequency_;
+   desired_spec.format = SDL_AUDIO_F32LE;
+   desired_spec.channels = frame_channels_;
+   sdl_device_channels_ = frame_channels_;
+-  sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
+-                                          SDLCallback, this);
++  sdl_stream_ = SDL_OpenAudioDeviceStream(playback_device, &desired_spec, SDLCallback, this);
+   if (!sdl_stream_) {
+     REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {}", SDL_GetError());
+     return false;
+@@ -80,8 +185,7 @@ bool SDLAudioDriver::Initialize() {
+     sdl_stream_ = nullptr;
+     desired_spec.channels = 2;
+     sdl_device_channels_ = 2;
+-    sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
+-                                            SDLCallback, this);
++    sdl_stream_ = SDL_OpenAudioDeviceStream(playback_device, &desired_spec, SDLCallback, this);
+     if (!sdl_stream_) {
+       REXAPU_ERROR("SDL_OpenAudioDeviceStream() stereo fallback failed: {}", SDL_GetError());
+       return false;
+@@ -106,6 +210,10 @@ bool SDLAudioDriver::Initialize() {
      return false;
    }
  
@@ -262,7 +354,7 @@ index 20a2cd8..22795cc 100644
    return true;
  }
  
-@@ -138,7 +196,19 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+@@ -138,7 +246,19 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
    }
  }
  
@@ -282,7 +374,7 @@ index 20a2cd8..22795cc 100644
    if (sdl_stream_) {
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
-@@ -166,6 +236,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -166,6 +286,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
      return;
    }
    const auto driver = static_cast<SDLAudioDriver*>(userdata);
