@@ -2079,7 +2079,7 @@ index 1254710..e48e9df 100644
    assert(buffer_ptr);
    assert(fetch_ptr);
 diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
-index bd6c797..b45ce23 100644
+index bd6c797..3e091c5 100644
 --- a/src/system/xam/content_manager.cpp
 +++ b/src/system/xam/content_manager.cpp
 @@ -16,9 +16,11 @@
@@ -2099,7 +2099,7 @@ index bd6c797..b45ce23 100644
  #include <rex/system/xobject.h>
  
 +REXCVAR_DEFINE_STRING(custom_songs_dir, "", "Content",
-+                      "Folder of custom song packages (CON files built with Magma), mounted in place; default <user data>/custom_songs");
++                      "Folder of custom song packages (CON files built with Magma or Onyx), mounted in place; default <user data>/custom_songs");
 +REXCVAR_DEFINE_STRING(content_owner_ids, "", "Content",
 +                      "Your XUIDs and console IDs (hex, comma-separated): installed packages licensed to them get their license bits");
 +
@@ -2122,7 +2122,7 @@ index bd6c797..b45ce23 100644
    device->Initialize();
    fs->RegisterDevice(std::move(device));
    fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
-@@ -99,8 +111,78 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
+@@ -99,8 +111,80 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
    return root_path_ / xuid_str / title_id_str / content_type_str;
  }
  
@@ -2136,11 +2136,13 @@ index bd6c797..b45ce23 100644
 +}
 +
 +// Customs say what built them in the description; repackaged official content
-+// does not. shortcut: Magma only (the tool seen so far); add Onyx's text once a
-+// package from it turns up.
++// does not. Magma: "Created with Magma: ...", Onyx: "Compiled by Onyx Music
++// Game Toolkit version ...".
 +static bool IsCustomSong(const rex::filesystem::StfsHeader& header) {
-+  return rex::string::to_utf8(header.metadata.description(rex::system::XLanguage::kEnglish))
-+      .starts_with("Created with Magma");
++  const auto description =
++      rex::string::to_utf8(header.metadata.description(rex::system::XLanguage::kEnglish));
++  return description.starts_with("Created with Magma") ||
++         description.starts_with("Compiled by Onyx Music Game Toolkit");
 +}
 +
 +void ContentManager::ListCustomSongs(uint32_t title_id, XContentType content_type,
@@ -2157,7 +2159,7 @@ index bd6c797..b45ce23 100644
 +    const auto& metadata = header->metadata;
 +    if (metadata.execution_info.title_id != title_id || metadata.content_type != content_type) continue;
 +    if (!IsCustomSong(*header)) {
-+      REXSYS_DEBUG("custom songs: {} was not built with Magma; skipped",
++      REXSYS_DEBUG("custom songs: {} was not built with Magma or Onyx; skipped",
 +                   rex::path_to_utf8(entry.path().filename()));
 +      continue;
 +    }
@@ -2201,7 +2203,7 @@ index bd6c797..b45ce23 100644
    uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
  
    // DLCs are stored in common directory
-@@ -170,6 +252,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+@@ -170,6 +254,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
      }
    }
  
@@ -2209,7 +2211,7 @@ index bd6c797..b45ce23 100644
    return result;
  }
  
-@@ -257,6 +340,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
+@@ -257,6 +342,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
  
  X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
                                         const XCONTENT_AGGREGATE_DATA& data) {
@@ -2217,7 +2219,7 @@ index bd6c797..b45ce23 100644
    {
      auto global_lock = global_critical_region_.Acquire();
      if (open_packages_.count(string::string_key_case(root_name))) {
-@@ -300,9 +384,14 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+@@ -300,9 +386,14 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
    }
    auto package = ResolvePackage(root_name, xuid, data);
    assert_not_null(package);
@@ -2235,7 +2237,7 @@ index bd6c797..b45ce23 100644
  
    {
      auto global_lock = global_critical_region_.Acquire();
-@@ -351,6 +440,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+@@ -351,6 +442,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
  X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                               std::vector<uint8_t> buffer) {
    auto global_lock = global_critical_region_.Acquire();
@@ -2243,7 +2245,7 @@ index bd6c797..b45ce23 100644
    auto package_path = ResolvePackagePath(xuid, data);
    std::filesystem::create_directories(package_path);
    if (std::filesystem::exists(package_path)) {
-@@ -366,6 +456,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+@@ -366,6 +458,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
  
  X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
    auto global_lock = global_critical_region_.Acquire();
@@ -2251,7 +2253,7 @@ index bd6c797..b45ce23 100644
  
    if (IsContentOpen(data)) {
      // TODO(Gliniak): Get real error code for this case.
-@@ -407,6 +498,7 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
+@@ -407,6 +500,7 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
  
  X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
                                                   const XCONTENT_AGGREGATE_DATA& data) {
@@ -2259,7 +2261,7 @@ index bd6c797..b45ce23 100644
    // Unmount phase: tolerant of not-mounted state
    ContentPackage* package = nullptr;
    {
-@@ -569,6 +661,16 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+@@ -569,6 +663,16 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
    return X_ERROR_SUCCESS;
  }
  
@@ -2276,7 +2278,7 @@ index bd6c797..b45ce23 100644
  X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
    if (!std::filesystem::exists(package_path)) {
      return X_ERROR_FILE_NOT_FOUND;
-@@ -584,10 +686,13 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -584,10 +688,13 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
    // root_path_/0000000000000000/{title_id}/00000002/{filename}/
    auto file_name = rex::path_to_utf8(package_path.filename());
  
@@ -2292,7 +2294,7 @@ index bd6c797..b45ce23 100644
    content_data.xuid = 0;
    content_data.set_file_name(file_name);
  
-@@ -601,6 +706,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -601,6 +708,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
  
    auto install_path = ResolvePackagePath(0, content_data);
  
@@ -2302,7 +2304,7 @@ index bd6c797..b45ce23 100644
    // Create destination directory
    std::error_code ec;
    std::filesystem::create_directories(install_path, ec);
-@@ -615,7 +723,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -615,7 +725,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
    }
  
    std::queue<rex::filesystem::Entry*> queue;
@@ -2311,7 +2313,7 @@ index bd6c797..b45ce23 100644
  
    while (!queue.empty()) {
      auto* entry = queue.front();
-@@ -631,13 +739,21 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -631,13 +741,21 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
      }
    }
  

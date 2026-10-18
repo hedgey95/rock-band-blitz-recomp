@@ -165,8 +165,8 @@ alternate title IDs; that is how it plays your Rock Band song packages.
   package licensed to someone else installs with no license bits. The SDK used
   to grant every license entry.
 - **Custom songs** (`--custom_songs_dir`, default `<user data>/custom_songs`):
-  CON packages built with Magma (their description starts "Created with
-  Magma") are listed as common content of their own title and type (customs
+  CON packages built with Magma or Onyx (their description starts "Created
+  with Magma" or "Compiled by Onyx Music Game Toolkit") are listed as common content of their own title and type (customs
   use type 1) and mounted in place with `StfsContainerDevice`: no extraction.
   They get the license bits they declare. Anything else in the folder is
   skipped (logged at debug level). The game cannot create, delete or write
