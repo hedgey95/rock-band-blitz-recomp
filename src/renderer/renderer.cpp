@@ -8,8 +8,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <semaphore>
-#include <thread>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -19,6 +17,7 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 #include "shader_container.h"
+#include "shader_translate.h"
 #include "shaders/present_cs.h"
 #include "shaders/resolve_depth_cs.h"
 #include "shaders/resolve_depth_ms_cs.h"
@@ -32,7 +31,7 @@ REXCVAR_DEFINE_STRING(dump_resolves, "", "Blitz",
 
 REXCVAR_DEFINE_STRING(native_shader_dir, "", "Blitz",
                       "Directory with the translated shaders (<container>.dxil); shaders missing there "
-                      "are translated at first use and saved there");
+                      "are translated when the game registers them (while it loads) and saved there");
 
 namespace blitz {
 
@@ -60,68 +59,6 @@ ID3D12DescriptorHeap* CreateHeap(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYP
   ID3D12DescriptorHeap* heap = nullptr;
   device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap));
   return heap;
-}
-
-// Runs a tool without a console window, below the game's priority. True if it exits with 0.
-bool RunTool(std::wstring command) {
-  STARTUPINFOW startup = {sizeof(startup)};
-  PROCESS_INFORMATION process = {};
-  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
-                      CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &startup, &process))
-    return false;
-  DWORD code = 1;
-  if (WaitForSingleObject(process.hProcess, 120000) == WAIT_OBJECT_0)
-    GetExitCodeProcess(process.hProcess, &code);
-  else
-    TerminateProcess(process.hProcess, 1);
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-  return code == 0;
-}
-
-// What tools/translate_shaders.py does for one container: save it as
-// <name>.xsc, translate it with XenosRecomp, compile with dxc (as a library if
-// it uses specialization constants), and return the DXIL, also saved as
-// <name>.dxil. Empty on failure (dxc's messages stay in <name>.dxc.log).
-std::vector<uint8_t> TranslateShader(const std::filesystem::path& dir, const std::string& name,
-                                     const std::string& container) {
-  // A few at a time, so a burst of new shaders leaves the game its cores.
-  static std::counting_semaphore<> slots(std::max(1u, std::thread::hardware_concurrency() / 4));
-  slots.acquire();
-  const auto start = std::chrono::steady_clock::now();
-  const auto file = [&](const char* extension) { return dir / (name + extension); };
-  const auto quote = [](const std::filesystem::path& path) { return L"\"" + path.wstring() + L"\""; };
-  std::ofstream(file(".xsc"), std::ios::binary).write(container.data(), container.size());
-  bool ok = RunTool(quote(BLITZ_XENOS_RECOMP) + L" " + quote(file(".xsc")) + L" " + quote(file(".hlsl")) +
-                    L" " + quote(BLITZ_SHADER_COMMON));
-  const wchar_t* target = L"";
-  if (ok) {
-    // Written under a temporary name so an interrupted compile never leaves a bad cache entry.
-    for (const wchar_t* t : {name.ends_with(".vs") ? L"vs_6_0" : L"ps_6_0", L"lib_6_3"}) {
-      target = t;
-      ok = RunTool(quote(BLITZ_DXC) + L" -T " + t +
-                   L" -HV 2021 -all-resources-bound -Wno-ignored-attributes -Qstrip_reflect -Qstrip_debug -Fo " +
-                   quote(file(".dxil.tmp")) + L" -Fe " + quote(file(".dxc.log")) + L" " + quote(file(".hlsl")));
-      if (ok) break;
-    }
-  }
-  std::error_code error;
-  if (ok) std::filesystem::rename(file(".dxil.tmp"), file(".dxil"), error);
-  std::vector<uint8_t> dxil;
-  if (ok && !error) {
-    std::ifstream in(file(".dxil"), std::ios::binary);
-    dxil.assign(std::istreambuf_iterator<char>(in), {});
-    std::filesystem::remove(file(".dxc.log"), error);
-  }
-  slots.release();
-  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  if (dxil.empty())
-    REXLOG_WARN("native_renderer: could not translate shader {} ({:.1f} s): {}", name, seconds,
-                *target ? "dxc failed, see " + file(".dxc.log").string() : std::string("XenosRecomp failed"));
-  else
-    REXLOG_INFO("native_renderer: translated shader {} ({}, {:.1f} s)", name,
-                std::filesystem::path(target).string(), seconds);
-  return dxil;
 }
 
 }  // namespace
@@ -940,6 +877,12 @@ void NativeRenderer::After(uint32_t function, PPCContext& ctx, uint8_t* base) {
     for (auto& p : pending_) p.range_from = Load(base, guest_device_ + d3d::kDeviceCommandPtr);
     return;
   }
+  // Shaders are looked up (and translated if missing) when the game registers
+  // them, while it loads, so none is translated during a song.
+  if (function == d3d::kRegisterVertexShader || function == d3d::kRegisterPixelShader) {
+    ShaderFor(ctx.r3.u32, base);
+    return;
+  }
   if (function == d3d::kDrawVerticesUP && inline_pending_) {
     inline_pending_ = false;
     DoDraw(inline_draw_, base);
@@ -964,6 +907,7 @@ void NativeRenderer::After(uint32_t function, PPCContext& ctx, uint8_t* base) {
       if (object && !(Load(base, pending.out_ptr) & 1)) {  // pixel; vertex ones get registered
         registered_[object] = {object + 40, Load(base, object + 24)};
         shader_objects_.erase(object);
+        ShaderFor(object, base);
       }
       break;
     }

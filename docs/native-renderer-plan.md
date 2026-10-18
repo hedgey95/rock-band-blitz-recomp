@@ -296,6 +296,48 @@ XenosRecomp from `out/build/xenos_recomp`, `shader_common.h` from the
 submodule, `dxc` from the Windows SDK), so only dev builds can translate. A
 release needs those tools shipped with the exe.
 
+**Superseded the same evening: at load, in the game.** Playing showed two
+problems. A section ending's shaders were translated mid-song, and that window
+had 65 frames over 25 ms (worst 231 ms). Then Windows Defender quarantined
+`XenosRecomp.exe` (`Trojan:Win32/Bearfoos.B!ml`, a machine-learning guess at an
+unsigned exe launched windowless by another), so later shaders failed. Now:
+- **When:** at registration. The game registers its whole shader library while
+  it loads (`kRegisterVertexShader`/`kRegisterPixelShader`, and pixel shaders
+  from `kCreateShader`); `After` calls `ShaderFor` right then, so a missing
+  shader is translated during the load, not at its first draw.
+- **How:** in the game, no helper programs. `src/renderer/shader_translate.cpp`
+  runs XenosRecomp's `ShaderRecompiler` (its `shader_recompiler.cpp` is built
+  into blitz.exe with XenosRecomp's `pch.h` force-included and BLITZ_RECOMP),
+  with `shader_common.h` embedded at configure time as bytes
+  (`shader_common_bytes.h`), then dxc through `IDxcCompiler3` from the Windows
+  SDK's `dxcompiler.dll` (copied next to the exe with `dxil.dll`) with
+  `translate_shaders.py`'s arguments. Below normal priority, a quarter of the
+  cores at a time, as before. No build-machine paths remain.
+
+Measured on the One Week mash tape (real time):
+- **Cold cache** (copy of the shader dir with 12 random `.dxil`/`.hlsl`
+  deleted): 470 shaders translated during the load (the library: 457 had never
+  been translated before), 468 succeeded. The 11 deleted ones this run registers came
+  back byte-identical to the offline set (the 12th is not registered by this
+  song). The five that failed under Defender translate. 59 draws were skipped
+  at the song start: a song registers its own shaders as it loads, and one
+  finished 0.3 s in.
+- **Warm cache:** nothing translated except two retries, no shader-related
+  skips. The song-start window (frames 2400–3000) has 61 frames over 25 ms,
+  worst 255 ms, the same as the cold run (61, 260 ms): that is the game's load
+  into the song, not translation.
+- **Not translatable yet:** `FEA0E8EA86513587.ps` and `9537B91BE45FE50C.ps` use
+  1D texture fetches, and XenosRecomp declares descriptor indices only for 2D,
+  3D and cube (`TEXTURE_DIMENSIONS`), so dxc rejects them. Neither has been
+  drawn in any run. Adding 1D changes the SharedConstants layout of every
+  shader and needs 1D views in the renderer.
+- **Gate:** 11/11, gameplay 0.02–0.04%. The title-screen frames (1300–2050)
+  moved from MAE 0.01 to 0.66 against stock, still 0.00% bad pixels: a
+  sub-pixel shift of the scrolling background. The stock run moved as well
+  (MAE 0.36 against its own previous gate) without running any of this code,
+  so the cause is outside it (likely the save data a play session left in the
+  shared user data folder).
+
 Measured on the One Week mash tape (real time, no frame lock):
 - **Regeneration.** 7 shaders (2 VS, 5 PS; title and gameplay) deleted from
   a copy of the shader dir (`rbb-gamedata/shader-hlsl-rt-test`). The run

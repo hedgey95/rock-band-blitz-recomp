@@ -33,6 +33,7 @@ set(BLITZ_SOURCES
     src/renderer/shader_container.cpp
     src/renderer/vertex_input.cpp
     src/renderer/renderer.cpp
+    src/renderer/shader_translate.cpp
     src/renderer/renderer_draw.cpp
     # Xenos texture layout math from the SDK (BSD, derived from Xenia), compiled
     # in because the GPU plugin it ships in is not part of the native path.
@@ -45,7 +46,6 @@ set(BLITZ_SOURCES
 file(GLOB _blitz_dxc "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64/dxc.exe")
 list(SORT _blitz_dxc)
 list(GET _blitz_dxc -1 BLITZ_DXC)
-file(TO_CMAKE_PATH "${BLITZ_DXC}" BLITZ_DXC)  # forward slashes: it is also a C string (renderer.cpp)
 set(BLITZ_SHADER_HEADERS "")
 foreach(_shader present_cs resolve_depth_cs resolve_depth_ms_cs)
     set(_out "${CMAKE_CURRENT_BINARY_DIR}/shaders/${_shader}.h")
@@ -68,13 +68,34 @@ endif()
 rexglue_setup_target(blitz)
 target_link_libraries(blitz PRIVATE dbghelp)
 target_include_directories(blitz PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")  # shaders/*.h
-# Runtime translation of shaders missing from --native_shader_dir (renderer.cpp)
-# uses the same tools as tools/translate_shaders.py.
-# shortcut: build-machine paths, so only dev builds translate; bundle the tools when packaging.
-target_compile_definitions(blitz PRIVATE
-    BLITZ_DXC="${BLITZ_DXC}"
-    BLITZ_XENOS_RECOMP="${CMAKE_CURRENT_SOURCE_DIR}/out/build/xenos_recomp/XenosRecomp/XenosRecomp.exe"
-    BLITZ_SHADER_COMMON="${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/XenosRecomp/XenosRecomp/shader_common.h")
+# Shaders missing from --native_shader_dir are translated inside the game
+# (src/renderer/shader_translate.cpp): XenosRecomp's translator is built in,
+# with shader_common.h embedded, and dxc runs through dxcompiler.dll.
+set(XENOS_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/XenosRecomp")
+target_sources(blitz PRIVATE "${XENOS_RECOMP_DIR}/XenosRecomp/shader_recompiler.cpp")
+set_source_files_properties("${XENOS_RECOMP_DIR}/XenosRecomp/shader_recompiler.cpp" PROPERTIES
+    COMPILE_OPTIONS "-include;windows.h;-include;objbase.h;-include;${XENOS_RECOMP_DIR}/XenosRecomp/pch.h;-Wno-switch;-Wno-unused-variable;-Wno-null-arithmetic;-fms-extensions;-w")
+target_compile_definitions(blitz PRIVATE BLITZ_RECOMP _CRT_SECURE_NO_WARNINGS)
+# pch.h includes these headers; only fmt is used, and that comes from the SDK.
+target_include_directories(blitz PRIVATE
+    "${XENOS_RECOMP_DIR}/XenosRecomp"
+    "${XENOS_RECOMP_DIR}/thirdparty/smol-v/source"
+    "${XENOS_RECOMP_DIR}/thirdparty/xxHash"
+    "${XENOS_RECOMP_DIR}/thirdparty/zstd/lib")
+set(_shader_common "${XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_shader_common}")
+file(READ "${_shader_common}" _bytes HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _bytes "${_bytes}")
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/shader_common_bytes.h"
+    CONTENT "// Generated from XenosRecomp's shader_common.h (CMakeLists.txt).\ninline constexpr unsigned char kShaderCommon[] = {${_bytes}};\n")
+get_filename_component(_sdk_bin "${BLITZ_DXC}" DIRECTORY)        # .../bin/<version>/x64
+get_filename_component(_sdk_version "${_sdk_bin}" DIRECTORY)
+get_filename_component(_sdk_version "${_sdk_version}" NAME)
+target_link_libraries(blitz PRIVATE
+    "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/Lib/${_sdk_version}/um/x64/dxcompiler.lib")
+add_custom_command(TARGET blitz POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_sdk_bin}/dxcompiler.dll" "${_sdk_bin}/dxil.dll"
+            "$<TARGET_FILE_DIR:blitz>")
 
 # Stock Xenia GPU plugin, kept only as the reference renderer while the native
 # one is built. Loaded at runtime with --gpu_plugin=xenos.
