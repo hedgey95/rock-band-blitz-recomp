@@ -21,6 +21,7 @@ set(BLITZ_SOURCES
     src/diagnostics.cpp
     src/title_keys.cpp
     src/content_install.cpp
+    src/hub.cpp
     src/custom_song_checks.cpp
     src/renderer/native_graphics.cpp
     src/renderer/d3d_hooks.cpp

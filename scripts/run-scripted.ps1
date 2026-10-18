@@ -22,7 +22,8 @@ if (-not $Seconds) { $Seconds = (($Shots | Measure-Object -Maximum).Maximum) + 2
 $gameArgs = @("--game_data_root=$data", "--gpu_plugin=xenos", "--fullscreen=false",
           "--input_replay=$(Resolve-Path $Tape)", "--log_file=$logs\$Name.log",
           "--audio_mute=$(if ($Sound) { 'false' } else { 'true' })",
-          "--window_hidden=$(if ($Show) { 'false' } else { 'true' })")
+          "--window_hidden=$(if ($Show) { 'false' } else { 'true' })",
+          "--config_file=none", "--hub_shown=true")  # the player's blitz.toml stays out of tests
 if ($Shots) { $gameArgs += @("--screenshot_at=$($Shots -join ',')", "--screenshot_prefix=$logs\$Name") }
 $gameArgs += $Extra
 Remove-Item "$logs\$Name.log", "$logs\$Name-*.png", "$logs\$Name-*.bmp" -ErrorAction SilentlyContinue

@@ -137,6 +137,26 @@ index fa2ef60..828556e 100644
  REXCVAR_DECLARE(int32_t, window_height);
  REXCVAR_DECLARE(bool, fullscreen);
  REXCVAR_DECLARE(int32_t, monitor);
+diff --git a/include/rex/ui/overlay/settings_overlay.h b/include/rex/ui/overlay/settings_overlay.h
+index 5b80eac..150224a 100644
+--- a/include/rex/ui/overlay/settings_overlay.h
++++ b/include/rex/ui/overlay/settings_overlay.h
+@@ -12,10 +12,15 @@
+ #pragma once
+ #include <filesystem>
+ #include <string>
++#include <imgui.h>
+ #include <rex/ui/imgui_dialog.h>
++#include <rex/ui/virtual_key.h>
+ 
+ namespace rex::ui {
+ 
++// The VirtualKey for an ImGui key (kNone if it has none): key capture for rebinding.
++VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key);
++
+ class SettingsDialog : public ImGuiDialog {
+  public:
+   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
 diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
 index 7a711a8..293849c 100644
 --- a/src/audio/audio_system.cpp
@@ -572,6 +592,44 @@ index ae72b7a..5fb2167 100644
 +}
 +
  }  // namespace rex::chrono
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 228728d..73f923e 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -535,13 +535,23 @@ std::vector<std::string> ListModifiedFlags() {
+   return result;
+ }
+ 
++// A TOML basic string: backslashes and quotes escaped (Windows paths are full of them).
++static std::string TomlQuote(const std::string& value) {
++  std::string out = "\"";
++  for (char c : value) {
++    if (c == '\\' || c == '"') out += '\\';
++    out += c;
++  }
++  return out + "\"";
++}
++
+ std::string SerializeToTOML() {
+   std::lock_guard lock(GetRegistryMutex());
+   std::string result;
+   for (const auto& entry : GetRegistryStorage()) {
+     if (entry.getter() != entry.default_value) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = " + TomlQuote(entry.getter()) + "\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
+@@ -556,7 +566,7 @@ std::string SerializeToTOML(std::string_view category) {
+   for (const auto& entry : GetRegistryStorage()) {
+     if (entry.category == category && entry.getter() != entry.default_value) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = " + TomlQuote(entry.getter()) + "\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
 index a744375..4468710 100644
 --- a/src/graphics/command_processor.cpp
@@ -2079,7 +2137,7 @@ index 1254710..e48e9df 100644
    assert(buffer_ptr);
    assert(fetch_ptr);
 diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
-index bd6c797..3e091c5 100644
+index bd6c797..f33dead 100644
 --- a/src/system/xam/content_manager.cpp
 +++ b/src/system/xam/content_manager.cpp
 @@ -16,9 +16,11 @@
@@ -2122,7 +2180,7 @@ index bd6c797..3e091c5 100644
    device->Initialize();
    fs->RegisterDevice(std::move(device));
    fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
-@@ -99,8 +111,80 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
+@@ -99,8 +111,75 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
    return root_path_ / xuid_str / title_id_str / content_type_str;
  }
  
@@ -2158,11 +2216,6 @@ index bd6c797..3e091c5 100644
 +    if (!read || !header->header.is_magic_valid()) continue;
 +    const auto& metadata = header->metadata;
 +    if (metadata.execution_info.title_id != title_id || metadata.content_type != content_type) continue;
-+    if (!IsCustomSong(*header)) {
-+      REXSYS_DEBUG("custom songs: {} was not built with Magma or Onyx; skipped",
-+                   rex::path_to_utf8(entry.path().filename()));
-+      continue;
-+    }
 +    XCONTENT_AGGREGATE_DATA data;
 +    data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
 +    data.content_type = content_type;
@@ -2203,7 +2256,7 @@ index bd6c797..3e091c5 100644
    uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
  
    // DLCs are stored in common directory
-@@ -170,6 +254,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+@@ -170,6 +249,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
      }
    }
  
@@ -2211,7 +2264,7 @@ index bd6c797..3e091c5 100644
    return result;
  }
  
-@@ -257,6 +342,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
+@@ -257,6 +337,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
  
  X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
                                         const XCONTENT_AGGREGATE_DATA& data) {
@@ -2219,7 +2272,7 @@ index bd6c797..3e091c5 100644
    {
      auto global_lock = global_critical_region_.Acquire();
      if (open_packages_.count(string::string_key_case(root_name))) {
-@@ -300,9 +386,14 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+@@ -300,9 +381,14 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
    }
    auto package = ResolvePackage(root_name, xuid, data);
    assert_not_null(package);
@@ -2237,7 +2290,7 @@ index bd6c797..3e091c5 100644
  
    {
      auto global_lock = global_critical_region_.Acquire();
-@@ -351,6 +442,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+@@ -351,6 +437,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
  X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                               std::vector<uint8_t> buffer) {
    auto global_lock = global_critical_region_.Acquire();
@@ -2245,7 +2298,7 @@ index bd6c797..3e091c5 100644
    auto package_path = ResolvePackagePath(xuid, data);
    std::filesystem::create_directories(package_path);
    if (std::filesystem::exists(package_path)) {
-@@ -366,6 +458,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+@@ -366,6 +453,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
  
  X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
    auto global_lock = global_critical_region_.Acquire();
@@ -2253,7 +2306,7 @@ index bd6c797..3e091c5 100644
  
    if (IsContentOpen(data)) {
      // TODO(Gliniak): Get real error code for this case.
-@@ -407,6 +500,7 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
+@@ -407,6 +495,7 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
  
  X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
                                                   const XCONTENT_AGGREGATE_DATA& data) {
@@ -2261,7 +2314,7 @@ index bd6c797..3e091c5 100644
    // Unmount phase: tolerant of not-mounted state
    ContentPackage* package = nullptr;
    {
-@@ -569,6 +663,16 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+@@ -569,6 +658,16 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
    return X_ERROR_SUCCESS;
  }
  
@@ -2278,7 +2331,7 @@ index bd6c797..3e091c5 100644
  X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
    if (!std::filesystem::exists(package_path)) {
      return X_ERROR_FILE_NOT_FOUND;
-@@ -584,10 +688,13 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -584,10 +683,13 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
    // root_path_/0000000000000000/{title_id}/00000002/{filename}/
    auto file_name = rex::path_to_utf8(package_path.filename());
  
@@ -2294,7 +2347,7 @@ index bd6c797..3e091c5 100644
    content_data.xuid = 0;
    content_data.set_file_name(file_name);
  
-@@ -601,6 +708,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -601,6 +703,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
  
    auto install_path = ResolvePackagePath(0, content_data);
  
@@ -2304,7 +2357,7 @@ index bd6c797..3e091c5 100644
    // Create destination directory
    std::error_code ec;
    std::filesystem::create_directories(install_path, ec);
-@@ -615,7 +725,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -615,7 +720,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
    }
  
    std::queue<rex::filesystem::Entry*> queue;
@@ -2313,7 +2366,7 @@ index bd6c797..3e091c5 100644
  
    while (!queue.empty()) {
      auto* entry = queue.front();
-@@ -631,13 +741,21 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -631,13 +736,21 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
      }
    }
  
@@ -2391,6 +2444,19 @@ index bf8252b..cc8755d 100644
    if (adapter == nullptr) {
      REXLOG_ERROR(
          "Failed to get an adapter supporting Direct3D 12 with the feature "
+diff --git a/src/ui/overlay/settings_overlay.cpp b/src/ui/overlay/settings_overlay.cpp
+index 4ede107..5581e58 100644
+--- a/src/ui/overlay/settings_overlay.cpp
++++ b/src/ui/overlay/settings_overlay.cpp
+@@ -53,7 +53,7 @@ static ImVec4 LifecycleColor(rex::cvar::Lifecycle lc, const SettingsStyle& style
+   return style.lifecycle_unknown;
+ }
+ 
+-static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
++rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
+   using VK = rex::ui::VirtualKey;
+   if (key >= ImGuiKey_A && key <= ImGuiKey_Z) {
+     return static_cast<VK>(static_cast<uint16_t>(VK::kA) + (key - ImGuiKey_A));
 diff --git a/src/ui/window.cpp b/src/ui/window.cpp
 index b4e045f..c0a5091 100644
 --- a/src/ui/window.cpp

@@ -192,6 +192,14 @@ plugged in, so the game played on the pad's speaker. Now:
   device, which follows Windows' default mid-game. A device picked by name or
   by skipping the pad stays put.
 
+## 13. Settings file and key capture (`src/core/cvar.cpp`, `settings_overlay.{h,cpp}`)
+
+- `SerializeToTOML` (behind `SaveConfig` and the F4 overlay's Save) wrote string
+  values without escaping, so a Windows path (`C:\Users\...`) made a file that
+  failed to load, losing every setting. Backslashes and quotes are now escaped.
+- `ImGuiKeyToVirtualKey` (the F4 overlay's key capture) is exported, so the
+  game's own hub (`src/hub.cpp`) rebinds keys the same way.
+
 # XenosRecomp patch
 
 `thirdparty/XenosRecomp` is a submodule pinned to hedge-dev/XenosRecomp
