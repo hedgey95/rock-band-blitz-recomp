@@ -2,7 +2,9 @@
 #   gate-n5.ps1 [-Name gate] [-Seconds 170]
 # Both runs use the frame clocks (SDK patches 9 and 10), so a tape replays frame
 # for frame; menus are compared at fixed frames, gameplay counted from the first
-# 3D frame (async loading moves the song start a frame or two). The reference
+# 3D frame (async loading moves the song start a frame or two), and so are the
+# tape's song inputs (--input_replay_busy_frame: the tape's song starts at 2883),
+# else the hit effects at the strike line drift against the notes. The reference
 # renders what the game asks for (--anisotropic_override=-1; the SDK forces 4x
 # anisotropy by default). Pass: every frame within 1% bad pixels
 # (tools/compare_frames.py). Hidden and muted, as every test run.
@@ -11,6 +13,7 @@ $root = Split-Path $PSScriptRoot -Parent
 $logs = Join-Path $root "out\logs"
 $data = Split-Path ((Get-Item (Join-Path $root "assets")).Target | Select-Object -First 1) -Parent
 $common = @("--title_keys=$data\title_keys.bin", "--audio_frame_clock=true", "--clock_frame_lock=true",
+            "--input_replay_busy_frame=2883",
             "--screenshot_frames=1300,1500,1750,2050,2400,2550,2800",
             "--screenshot_busy_frames=300,1200,2400,4800")
 Remove-Item "$logs\$Name-ref-f*", "$logs\$Name-nat-f*" -ErrorAction SilentlyContinue

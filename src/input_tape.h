@@ -50,6 +50,10 @@ std::string FormatTapeLine(uint32_t frame, const PadState& pad);
 // Driver for --input_replay=<file>; nullptr when the cvar is empty or the file is bad.
 std::unique_ptr<rex::input::InputDriver> CreateReplayInputDriver();
 
+// Called at the run's first busy (3D) frame: with --input_replay_busy_frame, replays
+// the rest of the tape relative to it (song inputs follow the song, not the boot).
+void RebaseInputReplay(uint32_t first_busy_frame);
+
 // Game frames presented so far (counted at the D3D present).
 uint32_t CurrentFrame();
 

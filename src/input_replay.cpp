@@ -16,10 +16,16 @@
 
 REXCVAR_DEFINE_STRING(input_replay, "", "Blitz",
                       "Input tape to play back, keyed by game frame (see src/input_tape.h)");
+REXCVAR_DEFINE_UINT32(input_replay_busy_frame, 0, "Blitz",
+                      "First busy (3D) frame of the run the tape was recorded in: steps from the "
+                      "first busy frame on are played that far from this run's first busy frame");
 
 namespace blitz {
 
 namespace {
+
+// This run's first busy frame minus --input_replay_busy_frame; 0 until the first busy frame.
+std::atomic<int32_t> g_busy_shift{0};
 
 using rex::X_RESULT;
 using rex::X_STATUS;
@@ -46,7 +52,8 @@ class ReplayInputDriver final : public InputDriver {
 
   X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override {
     if (id != kReplayDevice) return X_ERROR_DEVICE_NOT_CONNECTED;
-    const uint32_t frame = CurrentFrame();
+    // The game's joypad thread polls between presents; the song starts at the first busy frame.
+    const uint32_t frame = CurrentFrame() - g_busy_shift.load(std::memory_order_relaxed);
     // Index of the step in effect: the last one whose time has passed (0 = before the first).
     size_t current = std::upper_bound(steps_.begin(), steps_.end(), frame,
                                       [](uint32_t f, const TapeStep& s) { return f < s.frame; }) -
@@ -100,6 +107,14 @@ class ReplayInputDriver final : public InputDriver {
 };
 
 }  // namespace
+
+void RebaseInputReplay(uint32_t first_busy_frame) {
+  const uint32_t recorded = REXCVAR_GET(input_replay_busy_frame);
+  if (REXCVAR_GET(input_replay).empty() || !recorded) return;
+  g_busy_shift.store(int32_t(first_busy_frame - recorded), std::memory_order_relaxed);
+  REXLOG_INFO("input_replay: first busy frame {} (tape {}); later steps move {} frames",
+              first_busy_frame, recorded, int32_t(first_busy_frame - recorded));
+}
 
 std::unique_ptr<InputDriver> CreateReplayInputDriver() {
   const std::string path = REXCVAR_GET(input_replay);

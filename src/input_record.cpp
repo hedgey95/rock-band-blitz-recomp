@@ -61,7 +61,10 @@ class FrameClock final : public blitz::d3d::Listener {
     // Busy frames (3D scenes) start and end: lines up runs whose loads take different times.
     const bool busy = draws_ > 200;
     if (busy != busy_) REXLOG_INFO("frame_clock: frame {} {} ({} draws)", frame, busy ? "busy" : "quiet", draws_);
-    if (busy && !seen_busy_) blitz::OnFirstBusyFrame(frame);
+    if (busy && !seen_busy_) {
+      blitz::RebaseInputReplay(frame);
+      blitz::OnFirstBusyFrame(frame);
+    }
     seen_busy_ |= busy;
     busy_ = busy;
     draws_ = 0;

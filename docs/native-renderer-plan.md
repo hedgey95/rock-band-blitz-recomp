@@ -248,7 +248,8 @@ patch 9) and CPU time (patch 10); without them even two stock runs differ in
 37–39% of pixels. The reference runs with `--anisotropic_override=-1`, so it
 renders what the game asks for (the SDK forces 4× anisotropy by default).
 Gameplay frames are counted from the first 3D frame, since async loading moves
-the song start by a frame or two.
+the song start by a frame or two; so are the tape's song inputs
+(`--input_replay_busy_frame`), or the hit sparks drift against the notes.
 
 | Frames (mash tape) | Native vs stock |
 |---|---|
@@ -315,4 +316,14 @@ Measured on the One Week mash tape (real time, no frame lock):
   and the new native frames match the pre-change native frames (gate6, 13:04)
   within 0.03%. So the renderer is unchanged; the gate's alignment is flaky
   when the start frames differ (something on screen is not counted from the
-  first 3D frame).
+  first 3D frame). That something was the tape: its song presses were keyed
+  to frames since boot, so a start 2 frames later moved every hit spark 2
+  frames against the notes (two stock runs 2 frames apart differ the same
+  way, 1.02% at +1200). Fixed by `--input_replay_busy_frame=2883` (the tape's
+  first 3D frame): from the run's first 3D frame on, the tape plays relative
+  to it (`RebaseInputReplay`, `src/input_replay.cpp`). Three gates in a row
+  then passed with starts 0–1 frames apart (2881/2882, 2882/2882,
+  2881/2882), gameplay worst 0.59% (mostly 0.02%). The leftover is spark
+  jitter that two stock runs with the same start also show (0.58%): the
+  game's joypad thread polls between presents, so a press can land a frame
+  early or late.
