@@ -148,6 +148,36 @@ tape differ in 0–0.9% of pixels at the same distance from the first 3D frame
 (hit sparks), against 37–39% without. Off by default; `scripts/gate-n5.ps1`
 uses both.
 
+## 11. Content from your own console (`src/kernel/xam/xam_content.cpp`, `src/system/xam/content_manager.cpp`)
+
+Blitz's XEX lists Rock Band 1, 2 and 3 (45410829, 45410869, 45410914) as
+alternate title IDs; that is how it plays your Rock Band song packages.
+- `XamContentCreateEnumerator` also lists the alternate titles' content, as
+  the console does (the SDK did that only for aggregate enumerators).
+- `OpenContent` reads the license header under the package's own title, not
+  the running title's.
+- `InstallContent` (called by the game's `--install_content`) installs a package
+  under its own title and content type from its STFS header. It skips the
+  extraction when the package is already there, and only rewrites the header.
+- License bits come only from the package's licenses that name an owner listed
+  in `--content_owner_ids` (hex, comma-separated): a profile license (type
+  0x0009, the XUID) or a console license (type 0xF000, the console ID). A
+  package licensed to someone else installs with no license bits. The SDK used
+  to grant every license entry.
+- **Custom songs** (`--custom_songs_dir`, default `<user data>/custom_songs`):
+  CON packages built with Magma (their description starts "Created with
+  Magma") are listed as common content of their own title and type (customs
+  use type 1) and mounted in place with `StfsContainerDevice`: no extraction.
+  They get the license bits they declare. Anything else in the folder is
+  skipped (logged at debug level). The game cannot create, delete or write
+  thumbnails over these files: those calls return access denied.
+  `IsCustomSongRoot` tells the game-side hook (`src/custom_song_checks.cpp`)
+  which content roots are customs, so Blitz's chart checksum check is skipped
+  for them only.
+- Not fixed: type-1 content *installed* to the common (xuid 0) folder is listed
+  but opened under the profile's folder, so it fails to open. Real DLC is
+  type 2 (always common) and customs go through the custom-songs folder.
+
 # XenosRecomp patch
 
 `thirdparty/XenosRecomp` is a submodule pinned to hedge-dev/XenosRecomp

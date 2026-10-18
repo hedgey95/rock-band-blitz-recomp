@@ -83,6 +83,48 @@ index d26cd4f..567c198 100644
  
      kLoadShaderCount,
      kLoadShaderIndexUnknown = kLoadShaderCount,
+diff --git a/include/rex/system/xam/content_manager.h b/include/rex/system/xam/content_manager.h
+index 949d185..91d42e5 100644
+--- a/include/rex/system/xam/content_manager.h
++++ b/include/rex/system/xam/content_manager.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <map>
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
+@@ -148,6 +149,12 @@ class ContentManager {
+                                                    XContentType content_type,
+                                                    uint32_t title_id = -1);
+ 
++  // --custom_songs_dir: custom song packages dropped there are listed as common
++  // content of their own title and type, and mounted in place (read only).
++  std::filesystem::path CustomSongsDir() const;
++  // Whether the package open under `root_name` (e.g. "cnt00000000") is a custom song.
++  bool IsCustomSongRoot(std::string_view root_name);
++
+   std::unique_ptr<ContentPackage> ResolvePackage(const std::string_view root_name, uint64_t xuid,
+                                                  const XCONTENT_AGGREGATE_DATA& data);
+ 
+@@ -186,6 +193,16 @@ class ContentManager {
+   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
+                                            uint32_t title_id = -1);
+   std::filesystem::path ResolvePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
++
++  struct CustomSong {
++    std::filesystem::path path;
++    uint32_t license_mask;
++  };
++  // Custom songs ListContent has seen, by title, type and file name.
++  std::map<std::string, CustomSong> custom_songs_;
++  void ListCustomSongs(uint32_t title_id, XContentType content_type,
++                       std::vector<XCONTENT_AGGREGATE_DATA>& out);
++  const CustomSong* FindCustomSong(const XCONTENT_AGGREGATE_DATA& data);
+   std::filesystem::path ResolvePackageHeaderPath(const std::string_view file_name, uint64_t xuid,
+                                                  uint32_t title_id,
+                                                  XContentType content_type) const;
 diff --git a/include/rex/ui/flags.h b/include/rex/ui/flags.h
 index fa2ef60..828556e 100644
 --- a/include/rex/ui/flags.h
@@ -1772,6 +1814,65 @@ index 0000000..2b3db7e
 +          load_info.endian_32)));
 +}
 +entry_code_end_compute_xe
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 1fb1e16..ac6d7d0 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/types.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/user_module.h>
+ #include <rex/system/xam/content_device.h>
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xtypes.h>
+@@ -84,22 +85,34 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+   }
+ 
+   if (!device_info || device_info->device_id == DummyDeviceId::HDD) {
+-    // Enumerate user-specific content
+-    auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+-        static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)));
+-    for (const auto& content_data : content_datas) {
+-      auto item = e->AppendItem();
+-      *item = content_data;
++    // The title's content plus that of the XEX's alternate title IDs (Rock Band
++    // Blitz lists Rock Band 1-3, whose song packages it plays).
++    std::vector<uint32_t> title_ids{kCurrentlyRunningTitleId};
++    auto exe_module = REX_KERNEL_STATE()->GetExecutableModule();
++    if (exe_module && exe_module->xex_module()) {
++      const auto& alt_ids = exe_module->xex_module()->opt_alternate_title_ids();
++      title_ids.insert(title_ids.end(), alt_ids.begin(), alt_ids.end());
+     }
+-
+-    // Also enumerate common content (xuid=0)
+-    if (xuid != 0) {
+-      auto common_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+-          static_cast<uint32_t>(DummyDeviceId::HDD), 0, XContentType(uint32_t(content_type)));
+-      for (const auto& content_data : common_datas) {
++    for (uint32_t title_id : title_ids) {
++      // Enumerate user-specific content
++      auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
++          static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)),
++          title_id);
++      for (const auto& content_data : content_datas) {
+         auto item = e->AppendItem();
+         *item = content_data;
+       }
++
++      // Also enumerate common content (xuid=0)
++      if (xuid != 0) {
++        auto common_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
++            static_cast<uint32_t>(DummyDeviceId::HDD), 0, XContentType(uint32_t(content_type)),
++            title_id);
++        for (const auto& content_data : common_datas) {
++          auto item = e->AppendItem();
++          *item = content_data;
++        }
++      }
+     }
+   }
+ 
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp b/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
 index 765e042..c969495 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
@@ -1885,6 +1986,264 @@ index 1254710..e48e9df 100644
    // All of these parameters are REQUIRED.
    assert(buffer_ptr);
    assert(fetch_ptr);
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index bd6c797..b45ce23 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -16,9 +16,11 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/stfs_container_device.h>
++#include <rex/logging.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/content_device.h>
+@@ -26,6 +28,11 @@
+ #include <rex/system/xfile.h>
+ #include <rex/system/xobject.h>
+ 
++REXCVAR_DEFINE_STRING(custom_songs_dir, "", "Content",
++                      "Folder of custom song packages (CON files built with Magma), mounted in place; default <user data>/custom_songs");
++REXCVAR_DEFINE_STRING(content_owner_ids, "", "Content",
++                      "Your XUIDs and console IDs (hex, comma-separated): installed packages licensed to them get their license bits");
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+@@ -46,8 +53,13 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
+   content_data_ = data;
+ 
+   auto fs = kernel_state_->file_system();
+-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+-                                                                  /*allow_share_delete=*/true);
++  std::unique_ptr<rex::filesystem::Device> device;
++  if (std::filesystem::is_regular_file(package_path)) {  // a custom song, mounted in place
++    device = std::make_unique<rex::filesystem::StfsContainerDevice>(device_path_, package_path);
++  } else {
++    device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
++                                                               /*allow_share_delete=*/true);
++  }
+   device->Initialize();
+   fs->RegisterDevice(std::move(device));
+   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+@@ -99,8 +111,78 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
+   return root_path_ / xuid_str / title_id_str / content_type_str;
+ }
+ 
++std::filesystem::path ContentManager::CustomSongsDir() const {
++  const std::string dir = REXCVAR_GET(custom_songs_dir);
++  return dir.empty() ? root_path_ / "custom_songs" : rex::to_path(dir);
++}
++
++static std::string CustomSongKey(uint32_t title_id, XContentType type, std::string_view file_name) {
++  return fmt::format("{:08X}/{:08X}/{}", title_id, uint32_t(type), file_name);
++}
++
++// Customs say what built them in the description; repackaged official content
++// does not. shortcut: Magma only (the tool seen so far); add Onyx's text once a
++// package from it turns up.
++static bool IsCustomSong(const rex::filesystem::StfsHeader& header) {
++  return rex::string::to_utf8(header.metadata.description(rex::system::XLanguage::kEnglish))
++      .starts_with("Created with Magma");
++}
++
++void ContentManager::ListCustomSongs(uint32_t title_id, XContentType content_type,
++                                     std::vector<XCONTENT_AGGREGATE_DATA>& out) {
++  std::error_code ec;
++  for (const auto& entry : std::filesystem::directory_iterator(CustomSongsDir(), ec)) {
++    if (!entry.is_regular_file(ec)) continue;
++    auto header = std::make_unique<rex::filesystem::StfsHeader>();
++    auto file = rex::filesystem::OpenFile(entry.path(), "rb");
++    if (!file) continue;
++    const bool read = fread(header.get(), sizeof(*header), 1, file) == 1;
++    fclose(file);
++    if (!read || !header->header.is_magic_valid()) continue;
++    const auto& metadata = header->metadata;
++    if (metadata.execution_info.title_id != title_id || metadata.content_type != content_type) continue;
++    if (!IsCustomSong(*header)) {
++      REXSYS_DEBUG("custom songs: {} was not built with Magma; skipped",
++                   rex::path_to_utf8(entry.path().filename()));
++      continue;
++    }
++    XCONTENT_AGGREGATE_DATA data;
++    data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
++    data.content_type = content_type;
++    data.title_id = title_id;
++    data.xuid = 0;
++    data.set_file_name(rex::path_to_utf8(entry.path().filename()));
++    data.set_display_name(metadata.display_name(rex::system::XLanguage::kEnglish));
++    // A custom grants what it declares (Magma writes one open license).
++    uint32_t license_mask = 0;
++    for (const auto& license : header->header.licenses) license_mask |= license.license_bits;
++    {
++      auto global_lock = global_critical_region_.Acquire();
++      custom_songs_[CustomSongKey(title_id, content_type, data.file_name())] = {entry.path(),
++                                                                               license_mask};
++    }
++    out.push_back(data);
++  }
++}
++
++const ContentManager::CustomSong* ContentManager::FindCustomSong(const XCONTENT_AGGREGATE_DATA& data) {
++  const uint32_t title_id =
++      data.title_id == kCurrentlyRunningTitleId ? kernel_state_->title_id() : uint32_t(data.title_id);
++  auto global_lock = global_critical_region_.Acquire();
++  auto it = custom_songs_.find(CustomSongKey(title_id, data.content_type, data.file_name()));
++  return it == custom_songs_.end() ? nullptr : &it->second;
++}
++
++bool ContentManager::IsCustomSongRoot(std::string_view root_name) {
++  auto global_lock = global_critical_region_.Acquire();
++  auto it = open_packages_.find(string::string_key_case(root_name));
++  return it != open_packages_.end() && FindCustomSong(it->second->GetPackageContentData());
++}
++
+ std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
+                                                          const XCONTENT_AGGREGATE_DATA& data) {
++  if (const auto* custom = FindCustomSong(data)) return custom->path;
++
+   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+ 
+   // DLCs are stored in common directory
+@@ -170,6 +252,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+     }
+   }
+ 
++  if (xuid == 0) ListCustomSongs(title_id, content_type, result);
+   return result;
+ }
+ 
+@@ -257,6 +340,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
+ 
+ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
+                                        const XCONTENT_AGGREGATE_DATA& data) {
++  if (FindCustomSong(data)) return X_ERROR_ACCESS_DENIED;  // the user's files are read only
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     if (open_packages_.count(string::string_key_case(root_name))) {
+@@ -300,9 +384,14 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+   }
+   auto package = ResolvePackage(root_name, xuid, data);
+   assert_not_null(package);
+-  package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
+-      data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+-  content_license = package->GetPackageLicense();
++  if (const auto* custom = FindCustomSong(data)) {
++    content_license = custom->license_mask;
++  } else {
++    // The header sits beside the package, under its own title (an alternate title's content).
++    package->LoadPackageLicenseMask(
++        ResolvePackageHeaderPath(data.file_name(), xuid, data.title_id, data.content_type));
++    content_license = package->GetPackageLicense();
++  }
+ 
+   {
+     auto global_lock = global_critical_region_.Acquire();
+@@ -351,6 +440,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                                              std::vector<uint8_t> buffer) {
+   auto global_lock = global_critical_region_.Acquire();
++  if (FindCustomSong(data)) return X_ERROR_ACCESS_DENIED;
+   auto package_path = ResolvePackagePath(xuid, data);
+   std::filesystem::create_directories(package_path);
+   if (std::filesystem::exists(package_path)) {
+@@ -366,6 +456,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+ 
+ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+   auto global_lock = global_critical_region_.Acquire();
++  if (FindCustomSong(data)) return X_ERROR_ACCESS_DENIED;
+ 
+   if (IsContentOpen(data)) {
+     // TODO(Gliniak): Get real error code for this case.
+@@ -407,6 +498,7 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
+ 
+ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
+                                                  const XCONTENT_AGGREGATE_DATA& data) {
++  if (FindCustomSong(data)) return X_ERROR_ACCESS_DENIED;
+   // Unmount phase: tolerant of not-mounted state
+   ContentPackage* package = nullptr;
+   {
+@@ -569,6 +661,16 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+   return X_ERROR_SUCCESS;
+ }
+ 
++static bool IsContentOwner(uint64_t licensee_id) {
++  const uint16_t type = uint16_t(licensee_id >> 48);
++  const uint64_t id = type == 0xF000 ? licensee_id & 0xFFFFFFFFFFull : licensee_id;
++  if (type != 0x0009 && type != 0xF000) return false;
++  for (auto owner : rex::string::utf8_split(REXCVAR_GET(content_owner_ids), ",", true)) {
++    if (std::strtoull(std::string(owner).c_str(), nullptr, 16) == id) return true;
++  }
++  return false;
++}
++
+ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
+   if (!std::filesystem::exists(package_path)) {
+     return X_ERROR_FILE_NOT_FOUND;
+@@ -584,10 +686,13 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+   // root_path_/0000000000000000/{title_id}/00000002/{filename}/
+   auto file_name = rex::path_to_utf8(package_path.filename());
+ 
++  // Installed under the package's own title and type, as the console stores it.
++  const auto& metadata = device->header().metadata;
+   XCONTENT_AGGREGATE_DATA content_data;
+   content_data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+-  content_data.content_type = XContentType::kMarketplaceContent;
+-  content_data.title_id = kernel_state_->title_id();
++  content_data.content_type = metadata.content_type;
++  content_data.title_id = metadata.execution_info.title_id ? uint32_t(metadata.execution_info.title_id)
++                                                           : kernel_state_->title_id();
+   content_data.xuid = 0;
+   content_data.set_file_name(file_name);
+ 
+@@ -601,6 +706,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+ 
+   auto install_path = ResolvePackagePath(0, content_data);
+ 
++  // Already extracted: only the header (license mask) is rewritten.
++  const bool extracted = std::filesystem::exists(install_path);
++
+   // Create destination directory
+   std::error_code ec;
+   std::filesystem::create_directories(install_path, ec);
+@@ -615,7 +723,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+   }
+ 
+   std::queue<rex::filesystem::Entry*> queue;
+-  queue.push(root);
++  if (!extracted) queue.push(root);
+ 
+   while (!queue.empty()) {
+     auto* entry = queue.front();
+@@ -631,13 +739,21 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+     }
+   }
+ 
+-  // Compute license mask from STFS header licenses
++  // License mask from the STFS header licenses that name the owner: a profile
++  // (type 0x0009, the XUID) or console (type 0xF000, the console ID in the low
++  // 40 bits) listed in --content_owner_ids. Content licensed to anyone else
++  // installs unlicensed.
+   uint32_t license_mask = 0;
+   for (size_t i = 0; i < 0x10; i++) {
+-    if (device->header().header.licenses[i].license_flags) {
+-      license_mask |= device->header().header.licenses[i].license_bits;
++    const auto& license = device->header().header.licenses[i];
++    if (license.license_flags && IsContentOwner(license.licensee_id)) {
++      license_mask |= license.license_bits;
+     }
+   }
++  if (!license_mask) {
++    REXSYS_WARN("InstallContent: {} is not licensed to --content_owner_ids; installed unlicensed",
++                file_name);
++  }
+ 
+   // Write .header file
+   return WriteContentHeaderFile(0, content_data, license_mask);
 diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
 index bf8252b..cc8755d 100644
 --- a/src/ui/d3d12/d3d12_provider.cpp

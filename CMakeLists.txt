@@ -20,6 +20,8 @@ set(BLITZ_SOURCES
     src/input_tape.cpp
     src/diagnostics.cpp
     src/title_keys.cpp
+    src/content_install.cpp
+    src/custom_song_checks.cpp
     src/renderer/native_graphics.cpp
     src/renderer/d3d_hooks.cpp
     src/renderer/d3d_ops.cpp

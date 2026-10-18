@@ -10,6 +10,7 @@
 
 #include "input_tape.h"
 #include "title_keys.h"
+#include "content_install.h"
 #include "diagnostics.h"
 #include "renderer/native_graphics.h"
 
@@ -43,6 +44,7 @@ class BlitzApp : public rex::ReXApp {
 
   void OnPostLoadXexImage() override {
     blitz::ApplyTitleKeys(runtime()->memory());
+    blitz::InstallContentIfRequested(runtime()->kernel_state());
     blitz::DumpImageIfRequested(runtime()->memory(), PPCImageConfig.image_base,
                                 PPCImageConfig.image_size);
   }
