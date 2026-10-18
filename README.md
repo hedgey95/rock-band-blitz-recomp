@@ -23,12 +23,37 @@ native Direct3D 12 renderer that takes over the game's D3D calls.
 
 How to play: [docs/playing.md](docs/playing.md).
 
-## Building
+## Setup (the easy way)
+
+1. Download this repository (Code → Download ZIP, or `git clone`).
+2. Double-click **`Setup.cmd`**.
+3. In the window, pick:
+   - your **Rock Band Blitz package**, copied from your console: the file
+     inside `Content\0000000000000000\5841122D\000D0000\`. Setup checks that
+     it is the game.
+   - your **song keys** (`title_keys.bin`, 64 bytes). The songs' audio is
+     encrypted with keys a console derives in its hypervisor, which is not
+     emulated; without them the game runs silent. They are not included.
+   - an **install folder**.
+4. If tools are missing, click **Install missing tools**. Setup installs LLVM
+   20, CMake, Ninja, Git and the Visual Studio Build Tools (C++) with winget,
+   and Windows asks before each one. The Build Tools are a few GB.
+5. Click **Build the game**. The first build takes 20 to 40 minutes and needs
+   no attention; a desktop shortcut appears at the end.
+
+The game is built on your PC from your files; nothing from the game is
+downloaded or shared. If a build stops (no internet, a full disk), fix the
+cause and build again: it resumes. The log is `setup.log` in the install folder.
+`setup/build.ps1` does the work and can also be run without the window
+(`build.ps1 -Package <file> -Keys <file> -InstallDir <folder>`).
+
+## Building by hand
 
 Windows 10 or 11 (x64) with a Direct3D 12 GPU, and:
 
 - LLVM 20.1.8 (clang), CMake 4.x, Ninja (the SDK's toolchain; all available from winget)
-- The Windows SDK (its `dxc` compiles shaders, in the build and in the game)
+- The Visual Studio Build Tools with the C++ workload (clang uses its headers),
+  which include the Windows SDK (its `dxc` compiles shaders, in the build and in the game)
 - Git, and Python 3 for the optional tools in `tools/`
 
 ### 1. Sources

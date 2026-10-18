@@ -1,0 +1,6 @@
+# Patches keep their exact bytes for git apply, whatever core.autocrlf says
+# (a CRLF copy of rexglue-sdk.diff applies to nothing).
+*.diff -text
+# Windows scripts get CRLF in any checkout or GitHub ZIP.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
