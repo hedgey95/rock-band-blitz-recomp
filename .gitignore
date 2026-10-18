@@ -1,0 +1,20 @@
+# Third-party checkouts (pinned + patched by scripts, never committed)
+/sdk/
+/wiki/
+# Build output and logs
+/out/
+*.log
+# Game data: users bring their own copy. Never commit any of it.
+/assets/
+*.xex
+*.xexp
+*.ark
+*.hdr
+*.iso
+*.pk4
+*.zbm
+# Recompiled code is generated from the user's game; only the SDK glue script is kept.
+/generated/*
+!/generated/rexglue.cmake
+CMakeUserPresets.json
+*.bin

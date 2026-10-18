@@ -1,0 +1,49 @@
+# Function-boundary hints for codegen (included from blitz_manifest.toml).
+# Each entry: why the analyzer missed it, and what references it.
+
+[functions]
+# Small forwarding wrappers (a few register moves + tail-call `b`) with no PDATA
+# entry, reached only by another wrapper's tail-call `b`, so neither PDATA nor
+# gap-fill claimed them. Verified in generated code: each ends in its tail call.
+0x82354DC0 = {}  # <- b from sub_82340178; forwards to sub_82354D00
+0x82379D20 = {}  # <- b from sub_82364A10; forwards to sub_82380088
+0x8243C688 = {}  # <- b from sub_8242A8D8; forwards to sub_8243C458
+
+# Reached only through pointers in data (vtables/callback tables) and starting
+# right where the previous function ends, so codegen never registered them.
+# Found by tools/audit_code_pointers.py; each verified in generated code.
+0x821971A4 = {}  # after sub_82196980
+0x82343A80 = {}  # after sub_823438F0
+0x827149B8 = {}  # after sub_827148F0
+0x8277C3C0 = {}  # after sub_8277C308
+
+# Addresses built in code (lis + addi/ori), e.g. qsort comparators, that start
+# right where the previous function ends. Found by tools/audit_code_pointers.py.
+0x82344EB0 = {}  # lis at 0x82345864; after sub_82344E20
+0x82357ED0 = {}  # lis at 0x82356800; after sub_82357C20
+0x826166A0 = {}  # lis at 0x825FF980; after sub_826164C0
+0x8264C290 = {}  # lis at 0x826655B4; after sub_8264C128
+0x827EC038 = {}  # lis at 0x827EC0D8; after sub_827EBE08
+
+# XDK D3D, named for native-renderer phase N2 (docs/d3d-device-map.md). The draw
+# calls' arguments were checked against Xenia's decoded draw packets on every
+# draw of the One Week tape sample; the names follow the XDK API with the same
+# signatures. The flush helpers write the device's dirty register shadows.
+0x8251B220 = { name = "D3DDevice_DrawVertices" }         # (dev, prim, start, count)
+0x8251B638 = { name = "D3DDevice_DrawIndexedVertices" }  # (dev, prim, base_vertex, start_index, count)
+0x8251A7D8 = { name = "D3DDevice_BeginVertices" }        # (dev, prim, count, stride) -> inline data
+0x8251ACE0 = { name = "D3DDevice_BeginIndexedVertices" } # (dev, prim, base_vertex, verts, count, fmt, stride)
+0x8251A7C8 = { name = "D3DDevice_EndVertices" }
+0x8251AC98 = { name = "D3DDevice_DrawVerticesUP" }       # (dev, prim, count, data, stride)
+0x82521420 = { name = "D3D_FlushRegisters" }             # (dev, mask, first_reg, shadow): 1 reg per bit
+0x825217B8 = { name = "D3D_FlushFloatConstants" }        # (dev, mask, first_reg, shadow): 16 regs per bit
+0x82521660 = { name = "D3D_FlushFetchConstants" }        # (dev, mask): 6 regs per bit from device+1152
+0x825214E0 = { name = "D3D_FlushClipPlanes" }            # (dev, mask): 4 regs per bit from device+10272
+0x82516108 = { name = "D3D_CreateShader" }               # (container) -> vertex or pixel shader object
+0x82522550 = { name = "D3D_FlushShaders" }               # draw-time flush of the bound shaders (IM_LOAD)
+0x82516010 = { name = "D3D_RegisterVertexShader" }       # (object with container at +872, microcode address)
+0x82514420 = { name = "D3D_RegisterPixelShader" }        # (object with container at +40, microcode address)
+0x8250C938 = { name = "D3DDevice_Resolve" }              # (dev, flags, src rect, ?, ?, dest texture, dest point, level; slice, clear color, Z (f1), stencil, params)
+0x82519F50 = { name = "D3DDevice_ClearF" }               # (dev, flags, rect, color vector, ...; Z in f1)
+0x8251BD40 = { name = "D3DDevice_BeginTiling" }          # (dev, flags, tile count, tile rects, clear color, ...; Z in f1)
+0x8251D580 = { name = "D3DDevice_Swap" }                 # (dev, frontbuffer texture, ...): the only VdSwap caller

@@ -1,0 +1,1985 @@
+diff --git a/include/rex/audio/audio_driver.h b/include/rex/audio/audio_driver.h
+index 37ccbf2..881629a 100644
+--- a/include/rex/audio/audio_driver.h
++++ b/include/rex/audio/audio_driver.h
+@@ -16,12 +16,18 @@
+ 
+ namespace rex::audio {
+ 
++// Blitz patch 9: with --audio_frame_clock, audio plays (silently) at exactly
++// 16 ms per presented frame instead of at the device's pace; VdSwap calls this.
++void AdvanceAudioFrameClock();
++
+ class AudioDriver {
+  public:
+   explicit AudioDriver(memory::Memory* memory);
+   virtual ~AudioDriver();
+ 
+   virtual void SubmitFrame(uint32_t samples_ptr) = 0;
++  // Blitz patch 9: the client's callback (released by this driver) returned.
++  virtual void OnCallbackReturned() {}
+ 
+  protected:
+   inline uint8_t* TranslatePhysical(uint32_t guest_address) const {
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index f8949ca..fa82d5f 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <condition_variable>
+ #include <mutex>
+ #include <queue>
+ #include <stack>
+@@ -29,7 +30,10 @@ class SDLAudioDriver : public AudioDriver {
+ 
+   bool Initialize();
+   void SubmitFrame(uint32_t frame_ptr) override;
++  void OnCallbackReturned() override;
+   void Shutdown();
++  // Frame clock (patch 9): plays 16 ms of audio (3 frames).
++  void PlayOneVideoFrame();
+ 
+  protected:
+   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
+@@ -46,6 +50,9 @@ class SDLAudioDriver : public AudioDriver {
+   static const uint32_t channel_samples_ = 256;
+   static const uint32_t frame_samples_ = frame_channels_ * channel_samples_;
+   static const uint32_t frame_size_ = sizeof(float) * frame_samples_;
++  uint64_t frame_clock_waits_ = 0, frame_clock_timeouts_ = 0, frame_clock_frames_ = 0;
++  uint64_t callbacks_returned_ = 0;
++  std::condition_variable frames_submitted_;
+   std::queue<float*> frames_queued_ = {};
+   std::stack<float*> frames_unused_ = {};
+   std::mutex frames_mutex_ = {};
+diff --git a/include/rex/chrono/clock.h b/include/rex/chrono/clock.h
+index c19caea..c1bed84 100644
+--- a/include/rex/chrono/clock.h
++++ b/include/rex/chrono/clock.h
+@@ -79,6 +79,12 @@ class Clock {
+   // Sets the system time of the guest.
+   static void SetGuestSystemTime(uint64_t system_time);
+ 
++  // Blitz patch 10: a frame was presented (--clock_frame_lock); called by VdSwap.
++  static void AdvanceFrame();
++  // Guest ticks for pacing (the vblank timer): real time when the clock is
++  // frame-locked, so vblanks do not wait for the frames they pace.
++  static uint64_t QueryPacingTickCount();
++
+   // Scales a time duration in milliseconds, from guest time.
+   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
+   // Scales a time duration in 100ns ticks like FILETIME, from guest time.
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d26cd4f..567c198 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -423,6 +423,7 @@ class TextureCache {
+     kLoadShaderIndexCTX1,
+     kLoadShaderIndexDepthUnorm,
+     kLoadShaderIndexDepthFloat,
++    kLoadShaderIndexR32G32B32A32UNormToFloat,
+ 
+     kLoadShaderCount,
+     kLoadShaderIndexUnknown = kLoadShaderCount,
+diff --git a/include/rex/ui/flags.h b/include/rex/ui/flags.h
+index fa2ef60..828556e 100644
+--- a/include/rex/ui/flags.h
++++ b/include/rex/ui/flags.h
+@@ -27,6 +27,7 @@ REXCVAR_DECLARE(bool, present_dither);
+ REXCVAR_DECLARE(bool, present_allow_overscan_cutoff);
+ REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
+ REXCVAR_DECLARE(int32_t, window_width);
++REXCVAR_DECLARE(bool, window_hidden);
+ REXCVAR_DECLARE(int32_t, window_height);
+ REXCVAR_DECLARE(bool, fullscreen);
+ REXCVAR_DECLARE(int32_t, monitor);
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 7a711a8..293849c 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -40,6 +40,8 @@ REXCVAR_DEFINE_INT32(
+ // and let the normal AudioSystem handling take it, to prevent duplicate
+ // implementations. They can be found in xboxkrnl_audio_xma.cc
+ 
++REXCVAR_DECLARE(bool, audio_frame_clock);  // Blitz patch 9 (sdl_audio_driver.cpp)
++
+ namespace rex::audio {
+ 
+ namespace {
+@@ -137,6 +139,7 @@ void AudioSystem::WorkerThreadMain() {
+       auto global_lock = global_critical_region_.Acquire();
+       uint32_t client_callback = clients_[index].callback;
+       uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
++      AudioDriver* client_driver = clients_[index].driver;
+       global_lock.unlock();
+ 
+       if (client_callback) {
+@@ -148,6 +151,7 @@ void AudioSystem::WorkerThreadMain() {
+         uint64_t args[] = {client_callback_arg};
+         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
+                                       rex::countof(args));
++        if (client_driver) client_driver->OnCallbackReturned();  // Blitz patch 9
+         if (diag_pump_count < 10) {
+           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
+         }
+@@ -163,7 +167,9 @@ void AudioSystem::WorkerThreadMain() {
+       break;
+     }
+ 
+-    if (!pumped) {
++    // Blitz patch 9: under the frame clock, releases come with frames; a nap here
++    // would hold up the frames that wait for this worker's callbacks.
++    if (!pumped && !REXCVAR_GET(audio_frame_clock)) {
+       SCOPE_profile_cpu_i("apu", "Sleep");
+       rex::thread::Sleep(std::chrono::milliseconds(500));
+     }
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..22795cc 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -18,6 +18,10 @@
+ #include <rex/audio/downmix.h>
+ #include <rex/audio/flags.h>
+ #include <rex/audio/sdl/sdl_audio_driver.h>
++
++#include <algorithm>
++#include <vector>
++
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+@@ -25,8 +29,58 @@
+ #include <SDL3/SDL.h>
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_BOOL(audio_frame_clock, false, "Audio",
++                    "Dev: play audio (silently) at 1/60 s per presented frame instead of the "
++                    "device's pace, so games timed by audio advance with frames (deterministic tests)");
+ 
+ namespace rex::audio::sdl {
++namespace {
++std::mutex g_frame_clock_mutex;
++std::vector<SDLAudioDriver*> g_frame_clock_drivers;
++}  // namespace
++}  // namespace rex::audio::sdl
++
++namespace rex::audio {
++void AdvanceAudioFrameClock() {
++  if (!REXCVAR_GET(audio_frame_clock)) return;
++  std::lock_guard lock(sdl::g_frame_clock_mutex);
++  for (auto* driver : sdl::g_frame_clock_drivers) driver->PlayOneVideoFrame();
++}
++}  // namespace rex::audio
++
++namespace rex::audio::sdl {
++
++void SDLAudioDriver::PlayOneVideoFrame() {
++  // Three driver frames of 256 samples per video frame (768 samples: audio runs
++  // 4% slow against 1/60 s frames), a whole number so audio positions do not
++  // depend on the frame the audio started at. Each frame played releases the
++  // game's audio callback once (it mixes the next frame, or nothing when its
++  // audio is idle); the swap waits until those callbacks have returned, so the
++  // game sees the same audio progress at every frame of every run. Nothing
++  // queued means idle audio: nothing to play, nothing owed. A callback that
++  // does not return within 50 ms is left running, so a stall cannot hang.
++  std::unique_lock<std::mutex> guard(frames_mutex_);
++  if (++frame_clock_frames_ % 3600 == 0) {
++    REXAPU_INFO("audio_frame_clock: {} frames, {} waited for callbacks, {} gave up", frame_clock_frames_,
++                frame_clock_waits_, frame_clock_timeouts_);
++  }
++  const uint64_t returned_before = callbacks_returned_;
++  uint64_t released = 0;
++  for (int i = 0; i < 3 && !frames_queued_.empty(); ++i) {
++    frames_unused_.push(frames_queued_.front());
++    frames_queued_.pop();
++    semaphore_->Release(1, nullptr);
++    ++released;
++  }
++  auto done = [&] { return callbacks_returned_ >= returned_before + released; };
++  if (done()) return;
++  ++frame_clock_waits_;
++  if (!frames_submitted_.wait_for(guard, std::chrono::milliseconds(50), done) &&
++      ++frame_clock_timeouts_ <= 40) {
++    REXAPU_WARN("audio_frame_clock: frame {}: the audio callback did not return within 50 ms",
++                frame_clock_frames_);
++  }
++}
+ 
+ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
+     : AudioDriver(memory), semaphore_(semaphore) {}
+@@ -106,6 +160,10 @@ bool SDLAudioDriver::Initialize() {
+     return false;
+   }
+ 
++  if (REXCVAR_GET(audio_frame_clock)) {
++    std::lock_guard lock(g_frame_clock_mutex);
++    g_frame_clock_drivers.push_back(this);
++  }
+   return true;
+ }
+ 
+@@ -138,7 +196,19 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   }
+ }
+ 
++void SDLAudioDriver::OnCallbackReturned() {
++  {
++    std::unique_lock<std::mutex> guard(frames_mutex_);
++    ++callbacks_returned_;
++  }
++  frames_submitted_.notify_all();
++}
++
+ void SDLAudioDriver::Shutdown() {
++  {
++    std::lock_guard lock(g_frame_clock_mutex);
++    std::erase(g_frame_clock_drivers, this);
++  }
+   if (sdl_stream_) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+@@ -166,6 +236,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+     return;
+   }
+   const auto driver = static_cast<SDLAudioDriver*>(userdata);
++  if (REXCVAR_GET(audio_frame_clock)) {  // the frames play on VdSwap; the device gets silence
++    std::vector<uint8_t> silence(size_t(std::max(additional_amount, 0)), 0);
++    if (!silence.empty()) SDL_PutAudioStreamData(stream, silence.data(), int(silence.size()));
++    return;
++  }
+   const int sample_count =
+       static_cast<int>(channel_samples_ * std::max<uint8_t>(driver->sdl_device_channels_, 1));
+   const int len = static_cast<int>(sizeof(float) * sample_count);
+diff --git a/src/codegen/phase_gapfill.cpp b/src/codegen/phase_gapfill.cpp
+index f3da777..8ba1dae 100644
+--- a/src/codegen/phase_gapfill.cpp
++++ b/src/codegen/phase_gapfill.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "ppc/instruction.h"
+ 
++#include <algorithm>
+ #include <unordered_set>
+ 
+ #include <rex/codegen/phases.h>
+@@ -56,6 +57,11 @@ std::vector<CodeRegion> splitRegionOnTerminators(
+     if (decoded.is_return()) {
+       shouldSplit = true;
+       reason = "blr";
++    } else if (decoded.opcode == Opcode::bcctr && !decoded.is_conditional()) {
++      // Indirect tail call (e.g. a virtual-call thunk). If it is a jump table
++      // instead, the case code after it is absorbed back into this function.
++      shouldSplit = true;
++      reason = "bctr";
+     } else if (decoded.opcode == Opcode::b && decoded.branch_target.has_value()) {
+       uint32_t target = decoded.branch_target.value();
+       // Don't split on tail recursion (branch to own segment start)
+@@ -119,7 +125,7 @@ bool looksLikeExceptionData(const BinaryView& binary, const FunctionGraph& graph
+   return false;
+ }
+ 
+-void gapFillCodeRegions(CodegenContext& ctx) {
++std::vector<uint32_t> gapFillCodeRegions(CodegenContext& ctx) {
+   REXCODEGEN_TRACE("Analyze: checking for uncovered code regions...");
+ 
+   auto& graph = ctx.graph;
+@@ -134,9 +140,10 @@ void gapFillCodeRegions(CodegenContext& ctx) {
+ 
+   size_t gapsFound = 0;
+   size_t segmentsCreated = 0;
++  std::vector<uint32_t> registered;
+ 
+   for (const auto& region : scan.codeRegions) {
+-    // Split region on terminators (blr, tail calls), then check each segment
++    // Split region on terminators (blr, bctr, tail calls), then check each segment
+     auto segments = splitRegionOnTerminators(region, binary, knownCallables);
+ 
+     for (const auto& segment : segments) {
+@@ -159,6 +166,7 @@ void gapFillCodeRegions(CodegenContext& ctx) {
+       REXCODEGEN_TRACE("GapFill: registered sub_{:08X} (0x{:08X}-0x{:08X}, {} bytes)",
+                        segment.start, segment.start, segment.end, segmentSize);
+       segmentsCreated++;
++      registered.push_back(segment.start);
+     }
+ 
+     gapsFound++;
+@@ -170,6 +178,7 @@ void gapFillCodeRegions(CodegenContext& ctx) {
+   } else {
+     REXCODEGEN_TRACE("Analyze: no uncovered regions found");
+   }
++  return registered;
+ }
+ 
+ //=============================================================================
+@@ -218,14 +227,31 @@ namespace phases {
+ 
+ VoidResult GapFill(CodegenContext& ctx, ProgressReporter* reporter) {
+   (void)reporter;
+-  gapFillCodeRegions(ctx);
+-
+-  // Discover blocks for gap-filled functions
+-  auto known = buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true);
+-  size_t discovered = discoverPendingFunctions(ctx, known);
+-  REXCODEGEN_TRACE("Analyze: discovered blocks for {} gap-filled functions", discovered);
+-
+-  cleanupAbsorbedGapFills(ctx);
++  // A segment only splits on tail calls to already-known functions, so a run of
++  // tiny thunks that tail-call each other registers as one segment and discovery
++  // keeps just the first thunk. Re-scan until no new gap code is claimed.
++  // shortcut: a forward chain of thunks is recovered one link per pass; if the cap
++  // is hit, split runs on any `b` that leaves the run instead of raising it.
++  constexpr int kMaxPasses = 16;
++  int pass = 0;
++  for (; pass < kMaxPasses; ++pass) {
++    auto added = gapFillCodeRegions(ctx);
++
++    // Discover blocks for gap-filled functions
++    auto known = buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true);
++    size_t discovered = discoverPendingFunctions(ctx, known);
++    REXCODEGEN_TRACE("Analyze: gap-fill pass {} discovered blocks for {} functions", pass,
++                     discovered);
++
++    cleanupAbsorbedGapFills(ctx);
++    // Done once nothing new survives. Code inside a function whose blocks interleave
++    // with others looks uncovered to getFunctionContaining and is re-found, then absorbed.
++    if (std::none_of(added.begin(), added.end(),
++                     [&](uint32_t addr) { return ctx.graph.isEntryPoint(addr); }))
++      break;
++  }
++  if (pass == kMaxPasses)
++    REXCODEGEN_WARN("GapFill: still finding gap code after {} passes; some may be left", pass);
+ 
+   return Ok();
+ }
+diff --git a/src/core/clock.cpp b/src/core/clock.cpp
+index ae72b7a..5fb2167 100644
+--- a/src/core/clock.cpp
++++ b/src/core/clock.cpp
+@@ -22,6 +22,14 @@ REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
+ 
+ REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
+ 
++// Blitz patch 10: with --clock_frame_lock, guest time is the presented frame
++// count at 60 Hz (VdSwap calls Clock::AdvanceFrame), plus one tick per read so
++// that waits on the clock still finish, from a fixed date. With
++// --audio_frame_clock (patch 9), runs of one input tape repeat frame for frame.
++REXCVAR_DEFINE_BOOL(clock_frame_lock, false, "Clock",
++                    "Dev: guest time advances 1/60 s per presented frame, from a fixed date "
++                    "(deterministic test runs)");
++
+ namespace rex::chrono {
+ 
+ // Time scalar applied to all time operations.
+@@ -41,6 +49,10 @@ uint64_t last_guest_tick_count_ = 0;
+ uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
+ // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
+ std::mutex tick_mutex_;
++// Frames presented, for --clock_frame_lock.
++uint64_t locked_frames_ = 0;
++// 2012-06-19 00:00 UTC (the package's date), as a FILETIME.
++constexpr uint64_t kLockedSystemTimeBase = 129845376000000000ull;
+ 
+ void RecomputeGuestTickScalar() {
+   // Create a rational number with numerator (first) and denominator (second)
+@@ -64,6 +76,10 @@ void RecomputeGuestTickScalar() {
+ // Update the guest timer for all threads.
+ // Return a copy of the value so locking is reduced.
+ uint64_t UpdateGuestClock() {
++  if (REXCVAR_GET(clock_frame_lock)) {
++    std::lock_guard<std::mutex> lock(tick_mutex_);
++    return ++last_guest_tick_count_;
++  }
+   uint64_t host_tick_count = Clock::QueryHostTickCount();
+ 
+   if (REXCVAR_GET(clock_no_scaling)) {
+@@ -90,7 +106,7 @@ uint64_t UpdateGuestClock() {
+ 
+ // Offset of the current guest system file time relative to the guest base time.
+ inline uint64_t QueryGuestSystemTimeOffset() {
+-  if (REXCVAR_GET(clock_no_scaling)) {
++  if (REXCVAR_GET(clock_no_scaling) && !REXCVAR_GET(clock_frame_lock)) {
+     return Clock::QueryHostSystemTime() - guest_system_time_base_;
+   }
+ 
+@@ -161,6 +177,9 @@ uint64_t Clock::QueryGuestTickCount() {
+ }
+ 
+ uint64_t Clock::QueryGuestSystemTime() {
++  if (REXCVAR_GET(clock_frame_lock)) {
++    return kLockedSystemTimeBase + QueryGuestSystemTimeOffset();
++  }
+   if (REXCVAR_GET(clock_no_scaling)) {
+     return Clock::QueryHostSystemTime();
+   }
+@@ -241,4 +260,24 @@ void Clock::ScaleGuestDurationTimeval(int32_t* tv_sec, int32_t* tv_usec) {
+   *tv_usec = int32_t(scaled_usec);
+ }
+ 
++uint64_t Clock::QueryPacingTickCount() {
++  if (!REXCVAR_GET(clock_frame_lock)) {
++    return QueryGuestTickCount();
++  }
++  // Real time in guest ticks: vblanks keep their pace while guest time waits for frames.
++  const auto ratio = guest_tick_ratio();
++  return QueryHostTickCount() * ratio.first / ratio.second;
++}
++
++void Clock::AdvanceFrame() {
++  if (!REXCVAR_GET(clock_frame_lock)) {
++    return;
++  }
++  std::lock_guard<std::mutex> lock(tick_mutex_);
++  ++locked_frames_;
++  // Never backwards: a frame with more reads than ticks in a frame keeps its lead.
++  last_guest_tick_count_ =
++      std::max(locked_frames_ * guest_tick_frequency_ / 60, last_guest_tick_count_ + 1);
++}
++
+ }  // namespace rex::chrono
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..4468710 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <string_view>
+ 
+@@ -34,6 +35,7 @@
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
++#include <rex/ui/presenter.h>
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
+@@ -69,6 +71,11 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
+                     "automatic fallback to full synchronous readback")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_STRING(trace_draws, "", "GPU",
++                      "Dev: write the register file at each draw of --trace_draws_frames to this file");
++REXCVAR_DEFINE_STRING(trace_draws_frames, "", "GPU",
++                      "Dev: comma-separated frames (swaps so far) for --trace_draws");
++
+ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
+                      "Fake sample count for occlusion queries")
+     .range(1, 100000)
+@@ -82,6 +89,103 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+ 
+ namespace rex::graphics {
+ 
++// Dev trace for the native renderer (patches/README.md, patch 6). Per draw:
++// magic, frame, draw packet physical address, VS and PS IM_LOAD addresses,
++// then registers [0x2000, 0x2400) and [0x4000, 0x4928), host order.
++namespace {
++struct DrawTrace {
++  bool init = false;
++  FILE* file = nullptr;
++  std::vector<uint32_t> frames;
++  uint32_t swaps = 0;
++  uint32_t vs = 0, ps = 0;
++};
++DrawTrace g_draw_trace;
++
++void TraceDraw(const uint32_t* regs, uint32_t packet_phys) {
++  auto& t = g_draw_trace;
++  if (!t.init) {
++    t.init = true;
++    std::string list = REXCVAR_GET(trace_draws_frames);
++    for (size_t pos = 0; pos < list.size();) {
++      size_t end = std::min(list.find(',', pos), list.size());
++      t.frames.push_back(uint32_t(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 10)));
++      pos = end + 1;
++    }
++    if (!REXCVAR_GET(trace_draws).empty()) t.file = std::fopen(REXCVAR_GET(trace_draws).c_str(), "wb");
++  }
++  if (!t.file || std::find(t.frames.begin(), t.frames.end(), t.swaps) == t.frames.end()) return;
++  const uint32_t head[] = {0x57415244, t.swaps, packet_phys, t.vs, t.ps};
++  std::fwrite(head, sizeof(head), 1, t.file);
++  std::fwrite(regs + 0x2000, 4, 0x400, t.file);
++  std::fwrite(regs + 0x4000, 4, 0x928, t.file);
++  std::fflush(t.file);
++}
++
++// Blitz patch 8: frame-exact captures. For the swaps listed in the game's
++// --screenshot_frames (read by name), writes the frame just presented as
++// <--screenshot_prefix>-f<swap>.bmp, right after the swap executes, so the
++// stock renderer's frame N lines up with the game's frame N.
++void CaptureSwapIfRequested(ui::Presenter* presenter, memory::Memory* memory) {
++  static uint32_t swaps = 0;
++  // Re-read when it changes: the game may set it during the run.
++  static std::string list;
++  static std::vector<uint32_t> frames;
++  if (std::string now = cvar::GetFlagByName("screenshot_frames"); now != list) {
++    list = std::move(now);
++    frames.clear();
++    for (size_t pos = 0; pos < list.size();) {
++      size_t end = std::min(list.find(',', pos), list.size());
++      frames.push_back(uint32_t(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 10)));
++      pos = end + 1;
++    }
++  }
++  ++swaps;
++  if (!presenter || std::find(frames.begin(), frames.end(), swaps) == frames.end()) return;
++  // With the game's --dump_memory too, guest physical memory as of this swap on
++  // the GPU timeline (with --readback_resolve=full, it holds the frame's resolves).
++  if (const std::string dump = cvar::GetFlagByName("dump_memory"); !dump.empty() && memory) {
++    if (FILE* f = std::fopen((dump + "-gpu-f" + std::to_string(swaps) + ".bin").c_str(), "wb")) {
++      std::fwrite(memory->TranslatePhysical<const uint8_t*>(0), 1, 0x20000000, f);
++      std::fclose(f);
++    }
++  }
++  ui::RawImage image;
++  const std::string path =
++      cvar::GetFlagByName("screenshot_prefix") + "-f" + std::to_string(swaps) + ".bmp";
++  FILE* f = presenter->CaptureGuestOutput(image) ? std::fopen(path.c_str(), "wb") : nullptr;
++  if (!f) {
++    REXGPU_ERROR("screenshot_frames: no capture of swap {}", swaps);
++    return;
++  }
++  // 32-bit top-down BMP from R8 G8 B8 X8 rows (as the game's writer).
++  const uint32_t size = image.width * image.height * 4;
++  uint8_t header[54] = {'B', 'M'};
++  auto put = [&](int at, uint32_t v) { std::memcpy(header + at, &v, 4); };
++  put(2, 54 + size);
++  put(10, 54);
++  put(14, 40);
++  put(18, image.width);
++  put(22, uint32_t(-int32_t(image.height)));
++  header[26] = 1;
++  header[28] = 32;
++  put(34, size);
++  std::fwrite(header, 1, sizeof(header), f);
++  std::vector<uint8_t> row(image.width * 4);
++  for (uint32_t y = 0; y < image.height; ++y) {
++    const uint8_t* src = image.data.data() + y * image.stride;
++    for (uint32_t x = 0; x < image.width; ++x) {
++      row[4 * x] = src[4 * x + 2];
++      row[4 * x + 1] = src[4 * x + 1];
++      row[4 * x + 2] = src[4 * x];
++      row[4 * x + 3] = 255;
++    }
++    std::fwrite(row.data(), 1, row.size(), f);
++  }
++  std::fclose(f);
++}
++}  // namespace
++
+ using namespace rex::graphics::xenos;
+ 
+ namespace {
+@@ -929,6 +1033,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
+ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
+                                                   uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
++  ++g_draw_trace.swaps;
+ 
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+   {
+@@ -959,6 +1064,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  CaptureSwapIfRequested(graphics_system_ ? graphics_system_->presenter() : nullptr, memory_);
+ 
+   ++counter_;
+   return true;
+@@ -1296,6 +1402,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+     REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
+     return false;
+   }
++  const uint32_t trace_packet_phys = uint32_t(reader->buffer() + reader->read_offset() - 4 -
++                                              memory_->TranslatePhysical<uint8_t*>(0));
+   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+   vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
+   --count_remaining;
+@@ -1367,6 +1475,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   // Skip to the next command, for example, if there are immediate indexes that
+   // we don't support yet.
+   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
++  TraceDraw(register_file_->values, trace_packet_phys);
+ 
+   if (draw_succeeded) {
+     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+@@ -1524,6 +1633,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
+   assert_true(start == 0);
+ 
++  (shader_type == xenos::ShaderType::kVertex ? g_draw_trace.vs : g_draw_trace.ps) = addr;
+   auto shader =
+       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+   switch (shader_type) {
+@@ -1554,6 +1664,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer*
+   assert_true(start == 0);
+   assert_true(reader->read_count() >= size_dwords * 4);
+   assert_true(count - 2 >= size_dwords);
++  (shader_type == xenos::ShaderType::kVertex ? g_draw_trace.vs : g_draw_trace.ps) = 1;
+   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
+                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
+   switch (shader_type) {
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 2be0e8e..5a04cdd 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -50,6 +50,7 @@ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/texture_load_bgrg8_rgbg8_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/texture_load_ctx1_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/texture_load_depth_float_cs.h"
++#include "../shaders/bytecode/d3d12_5_1/texture_load_r32g32b32a32_unorm_float_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/texture_load_depth_float_scaled_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/texture_load_depth_unorm_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/texture_load_depth_unorm_scaled_cs.h"
+@@ -240,9 +241,10 @@ const D3D12TextureCache::HostFormat D3D12TextureCache::host_formats_[64] = {
+      kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
+      xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
+     // k_32_32_32_32
+-    {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown, DXGI_FORMAT_UNKNOWN,
+-     kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
+-     xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
++    // No 32-bit UNORM on the host: converted to float on load (unsigned only).
++    {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
++     kLoadShaderIndexR32G32B32A32UNormToFloat, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
++     false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
+     // k_32_FLOAT
+     {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, kLoadShaderIndex32bpb, DXGI_FORMAT_R32_FLOAT,
+      kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
+@@ -513,6 +515,9 @@ bool D3D12TextureCache::Initialize() {
+       shaders::texture_load_depth_unorm_cs, sizeof(shaders::texture_load_depth_unorm_cs)};
+   load_shader_code[kLoadShaderIndexDepthFloat] = D3D12_SHADER_BYTECODE{
+       shaders::texture_load_depth_float_cs, sizeof(shaders::texture_load_depth_float_cs)};
++  load_shader_code[kLoadShaderIndexR32G32B32A32UNormToFloat] =
++      D3D12_SHADER_BYTECODE{shaders::texture_load_r32g32b32a32_unorm_float_cs,
++                            sizeof(shaders::texture_load_r32g32b32a32_unorm_float_cs)};
+   D3D12_SHADER_BYTECODE load_shader_code_scaled[kLoadShaderCount] = {};
+   if (IsDrawResolutionScaled()) {
+     load_shader_code_scaled[kLoadShaderIndex8bpb] = D3D12_SHADER_BYTECODE{
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..8a03c1f 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -157,9 +157,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+         uint64_t vsync_interval_ticks =
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        uint64_t last_frame_time = chrono::Clock::QueryPacingTickCount();  // Blitz patch 10
+         while (vsync_worker_running_) {
+-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
++          uint64_t current_time = chrono::Clock::QueryPacingTickCount();  // Blitz patch 10
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+           while (current_time - last_frame_time >= interval_ticks) {
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..3eba00c 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -202,6 +202,8 @@ const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCo
+     {4, 4, 4, 3},
+     // kDepthFloat
+     {4, 4, 4, 3},
++    // kR32G32B32A32UNormToFloat
++    {4, 4, 16, 1},
+ };
+ 
+ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shared_memory,
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/texture_load_r32g32b32a32_unorm_float_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/texture_load_r32g32b32a32_unorm_float_cs.h
+new file mode 100644
+index 0000000..c31927b
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/texture_load_r32g32b32a32_unorm_float_cs.h
+@@ -0,0 +1,1009 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions: 
++//
++// cbuffer push_consts_xe
++// {
++//
++//   uint xe_texture_load_is_tiled_3d_endian_scale;// Offset:    0 Size:     4
++//   uint xe_texture_load_guest_offset; // Offset:    4 Size:     4
++//   uint xe_texture_load_guest_pitch_aligned;// Offset:    8 Size:     4
++//   uint xe_texture_load_guest_z_stride_block_rows_aligned;// Offset:   12 Size:     4
++//   uint3 xe_texture_load_size_blocks; // Offset:   16 Size:    12
++//   uint xe_texture_load_host_offset;  // Offset:   28 Size:     4
++//   uint xe_texture_load_host_pitch;   // Offset:   32 Size:     4
++//   uint xe_texture_load_height_texels;// Offset:   36 Size:     4 [unused]
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// xe_texture_load_source            texture   uint4         buf      T0             t0      1 
++// xe_texture_load_dest                  UAV   uint4         buf      U0             u0      1 
++// push_consts_xe                    cbuffer      NA          NA     CB0            cb0      1 
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][3], immediateIndexed, space=0
++dcl_resource_buffer (uint,uint,uint,uint) T0[0:0], space=0
++dcl_uav_typed_buffer (uint,uint,uint,uint) U0[0:0], space=0
++dcl_input vThreadID.xyz
++dcl_temps 5
++dcl_thread_group 4, 32, 1
++and r0.xy, CB0[0][0].xxxx, l(1, 2, 0, 0)
++ishl r1.x, vThreadID.x, l(1)
++mov r1.y, vThreadID.y
++uge r0.zw, r1.xxxy, CB0[0][1].xxxy
++or r0.z, r0.w, r0.z
++if_nz r0.z
++  ret 
++endif 
++ubfe r0.z, l(2), l(2), CB0[0][0].x
++ishl r0.w, r1.x, l(4)
++imad r1.y, vThreadID.z, CB0[0][1].y, vThreadID.y
++imad r1.y, r1.y, CB0[0][2].x, r0.w
++iadd r1.y, r1.y, CB0[0][1].w
++ushr r1.y, r1.y, l(4)
++if_nz r0.x
++  if_nz r0.y
++    ishr r2.xyz, vThreadID.yzyy, l(4, 2, 3, 0)
++    ushr r1.zw, CB0[0][0].wwwz, l(0, 0, 4, 5)
++    imad r0.y, r2.y, r1.z, r2.x
++    ibfe r2.xw, l(27, 0, 0, 29), l(4, 0, 0, 2), vThreadID.xxxx
++    imad r0.y, r0.y, r1.w, r2.x
++    ishl r1.z, vThreadID.y, l(12)
++    and r1.z, r1.z, l(0x00006000)
++    bfi r1.z, l(3), l(10), r1.x, r1.z
++    ishr r1.z, r1.z, l(6)
++    iadd r1.w, r2.y, r2.z
++    bfi r2.x, l(1), l(1), r1.w, l(0)
++    iadd r2.x, r2.x, r2.w
++    bfi r2.x, l(2), l(1), r2.x, l(0)
++    bfi r1.w, l(1), l(0), r1.w, r2.x
++    bfi r2.xy, l(18, 18, 0, 0), l(12, 15, 0, 0), r0.yyyy, l(0, 0, 0, 0)
++    imad r2.xy, r1.zzzz, l(2, 16, 0, 0), r2.xyxx
++    bfi r2.xy, l(2, 2, 0, 0), l(10, 13, 0, 0), vThreadID.zzzz, r2.xyxx
++    bfi r0.y, l(1), l(4), vThreadID.y, l(0)
++    ubfe r1.z, l(3), l(6), r2.x
++    and r2.z, r1.w, l(6)
++    bfi r1.w, l(1), l(8), r1.w, l(0)
++    imad r1.z, r1.z, l(32), r1.w
++    imad r1.z, r2.z, l(4), r1.z
++    bfi r2.xy, l(6, 6, 0, 0), l(0, 3, 0, 0), r0.yyyy, r2.xyxx
++    bfi r0.y, l(9), l(3), r1.z, r2.y
++    bfi r0.y, l(6), l(0), r2.x, r0.y
++  else 
++    ibfe r1.zw, l(0, 0, 27, 29), l(0, 0, 4, 2), vThreadID.xxxx
++    ishr r2.xy, vThreadID.yyyy, l(5, 2, 0, 0)
++    ushr r2.z, CB0[0][0].z, l(5)
++    imad r1.z, r2.x, r2.z, r1.z
++    ishl r2.x, vThreadID.y, l(7)
++    and r2.xz, r2.xxxx, l(1792, 0, 2048, 0)
++    bfi r2.w, l(3), l(5), r1.x, r2.x
++    bfi r2.w, l(21), l(11), r1.z, r2.w
++    bfi r3.x, l(1), l(4), vThreadID.y, l(0)
++    iadd r2.w, r2.w, r3.x
++    ishl r3.yz, r2.xxxx, l(0, 3, 2, 0)
++    bfi r3.yz, l(0, 3, 3, 0), l(0, 8, 7, 0), r1.xxxx, r3.yyzy
++    bfi r1.xz, l(21, 0, 21, 0), l(14, 0, 13, 0), r1.zzzz, r3.yyzy
++    imad r1.xz, r3.xxxx, l(8, 0, 4, 0), r1.xxzx
++    bfi r1.x, l(12), l(0), r2.z, r1.x
++    and r1.z, r1.z, l(1792)
++    iadd r1.x, r1.x, r1.z
++    and r1.z, r2.y, l(2)
++    iadd r1.z, r1.w, r1.z
++    bfi r1.z, l(2), l(6), r1.z, l(0)
++    iadd r1.x, r1.x, r1.z
++    bfi r0.y, l(6), l(0), r2.w, r1.x
++  endif 
++else 
++  imad r1.x, vThreadID.z, CB0[0][0].w, vThreadID.y
++  imad r0.y, r1.x, CB0[0][0].z, r0.w
++endif 
++iadd r0.y, r0.y, CB0[0][0].y
++ushr r0.y, r0.y, l(4)
++ld r2.xyzw, r0.yyyy, T0[0].xyzw
++ieq r1.xzw, r0.zzzz, l(1, 0, 2, 3)
++or r0.zw, r1.zzzw, r1.xxxz
++if_nz r0.z
++  ishl r3.xyzw, r2.xyzw, l(8, 8, 8, 8)
++  and r3.xyzw, r3.xyzw, l(0xff00ff00, 0xff00ff00, 0xff00ff00, 0xff00ff00)
++  ushr r4.xyzw, r2.xyzw, l(8, 8, 8, 8)
++  and r4.xyzw, r4.xyzw, l(0x00ff00ff, 0x00ff00ff, 0x00ff00ff, 0x00ff00ff)
++  iadd r2.xyzw, r3.xyzw, r4.xyzw
++endif 
++if_nz r0.w
++  ushr r3.xyzw, r2.xyzw, l(16, 16, 16, 16)
++  bfi r2.xyzw, l(16, 16, 16, 16), l(16, 16, 16, 16), r2.xyzw, r3.xyzw
++endif 
++utof r2.xyzw, r2.xyzw
++mul r2.xyzw, r2.xyzw, l(0.000000, 0.000000, 0.000000, 0.000000)
++store_uav_typed U0[0].xyzw, r1.yyyy, r2.xyzw
++iadd r1.x, r1.y, l(1)
++if_nz r0.x
++  mov r0.x, l(32)
++else 
++  mov r0.x, l(16)
++endif 
++ushr r0.x, r0.x, l(4)
++iadd r0.x, r0.x, r0.y
++ld r2.xyzw, r0.xxxx, T0[0].xyzw
++if_nz r0.z
++  ishl r3.xyzw, r2.xyzw, l(8, 8, 8, 8)
++  and r3.xyzw, r3.xyzw, l(0xff00ff00, 0xff00ff00, 0xff00ff00, 0xff00ff00)
++  ushr r4.xyzw, r2.xyzw, l(8, 8, 8, 8)
++  and r4.xyzw, r4.xyzw, l(0x00ff00ff, 0x00ff00ff, 0x00ff00ff, 0x00ff00ff)
++  iadd r2.xyzw, r3.xyzw, r4.xyzw
++endif 
++if_nz r0.w
++  ushr r0.xyzw, r2.xyzw, l(16, 16, 16, 16)
++  bfi r2.xyzw, l(16, 16, 16, 16), l(16, 16, 16, 16), r2.xyzw, r0.xyzw
++endif 
++utof r0.xyzw, r2.xyzw
++mul r0.xyzw, r0.xyzw, l(0.000000, 0.000000, 0.000000, 0.000000)
++store_uav_typed U0[0].xyzw, r1.xxxx, r0.xyzw
++ret 
++// Approximately 113 instruction slots used
++#endif
++
++const BYTE texture_load_r32g32b32a32_unorm_float_cs[] =
++{
++     68,  88,  66,  67, 172,  45, 
++     41,  95,   9,  12, 199, 176, 
++    237, 129,  36, 100, 150, 214, 
++    162, 241,   1,   0,   0,   0, 
++    168,  19,   0,   0,   5,   0, 
++      0,   0,  52,   0,   0,   0, 
++     20,   4,   0,   0,  36,   4, 
++      0,   0,  52,   4,   0,   0, 
++     12,  19,   0,   0,  82,  68, 
++     69,  70, 216,   3,   0,   0, 
++      1,   0,   0,   0, 240,   0, 
++      0,   0,   3,   0,   0,   0, 
++     60,   0,   0,   0,   1,   5, 
++     83,  67,   0,   5,   0,   0, 
++    173,   3,   0,   0,  19,  19, 
++     68,  37,  60,   0,   0,   0, 
++     24,   0,   0,   0,  40,   0, 
++      0,   0,  40,   0,   0,   0, 
++     36,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++    180,   0,   0,   0,   2,   0, 
++      0,   0,   4,   0,   0,   0, 
++      1,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      1,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 203,   0, 
++      0,   0,   4,   0,   0,   0, 
++      4,   0,   0,   0,   1,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,  12,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0, 224,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    120, 101,  95, 116, 101, 120, 
++    116, 117, 114, 101,  95, 108, 
++    111,  97, 100,  95, 115, 111, 
++    117, 114,  99, 101,   0, 120, 
++    101,  95, 116, 101, 120, 116, 
++    117, 114, 101,  95, 108, 111, 
++     97, 100,  95, 100, 101, 115, 
++    116,   0, 112, 117, 115, 104, 
++     95,  99, 111, 110, 115, 116, 
++    115,  95, 120, 101,   0, 171, 
++    224,   0,   0,   0,   8,   0, 
++      0,   0,   8,   1,   0,   0, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     72,   2,   0,   0,   0,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0, 120,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 156,   2, 
++      0,   0,   4,   0,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0, 120,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 185,   2,   0,   0, 
++      8,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
++    120,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    221,   2,   0,   0,  12,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0, 120,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,  15,   3, 
++      0,   0,  16,   0,   0,   0, 
++     12,   0,   0,   0,   2,   0, 
++      0,   0,  52,   3,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,  88,   3,   0,   0, 
++     28,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
++    120,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    116,   3,   0,   0,  32,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0, 120,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 143,   3, 
++      0,   0,  36,   0,   0,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0, 120,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 120, 101,  95, 116, 
++    101, 120, 116, 117, 114, 101, 
++     95, 108, 111,  97, 100,  95, 
++    105, 115,  95, 116, 105, 108, 
++    101, 100,  95,  51, 100,  95, 
++    101, 110, 100, 105,  97, 110, 
++     95, 115,  99,  97, 108, 101, 
++      0, 100, 119, 111, 114, 100, 
++      0, 171,   0,   0,  19,   0, 
++      1,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 113,   2, 
++      0,   0, 120, 101,  95, 116, 
++    101, 120, 116, 117, 114, 101, 
++     95, 108, 111,  97, 100,  95, 
++    103, 117, 101, 115, 116,  95, 
++    111, 102, 102, 115, 101, 116, 
++      0, 120, 101,  95, 116, 101, 
++    120, 116, 117, 114, 101,  95, 
++    108, 111,  97, 100,  95, 103, 
++    117, 101, 115, 116,  95, 112, 
++    105, 116,  99, 104,  95,  97, 
++    108, 105, 103, 110, 101, 100, 
++      0, 120, 101,  95, 116, 101, 
++    120, 116, 117, 114, 101,  95, 
++    108, 111,  97, 100,  95, 103, 
++    117, 101, 115, 116,  95, 122, 
++     95, 115, 116, 114, 105, 100, 
++    101,  95,  98, 108, 111,  99, 
++    107,  95, 114, 111, 119, 115, 
++     95,  97, 108, 105, 103, 110, 
++    101, 100,   0, 120, 101,  95, 
++    116, 101, 120, 116, 117, 114, 
++    101,  95, 108, 111,  97, 100, 
++     95, 115, 105, 122, 101,  95, 
++     98, 108, 111,  99, 107, 115, 
++      0, 117, 105, 110, 116,  51, 
++      0, 171, 171, 171,   1,   0, 
++     19,   0,   1,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     43,   3,   0,   0, 120, 101, 
++     95, 116, 101, 120, 116, 117, 
++    114, 101,  95, 108, 111,  97, 
++    100,  95, 104, 111, 115, 116, 
++     95, 111, 102, 102, 115, 101, 
++    116,   0, 120, 101,  95, 116, 
++    101, 120, 116, 117, 114, 101, 
++     95, 108, 111,  97, 100,  95, 
++    104, 111, 115, 116,  95, 112, 
++    105, 116,  99, 104,   0, 120, 
++    101,  95, 116, 101, 120, 116, 
++    117, 114, 101,  95, 108, 111, 
++     97, 100,  95, 104, 101, 105, 
++    103, 104, 116,  95, 116, 101, 
++    120, 101, 108, 115,   0,  77, 
++    105,  99, 114, 111, 115, 111, 
++    102, 116,  32,  40,  82,  41, 
++     32,  72,  76,  83,  76,  32, 
++     83, 104,  97, 100, 101, 114, 
++     32,  67, 111, 109, 112, 105, 
++    108, 101, 114,  32,  49,  48, 
++     46,  49,   0, 171, 171, 171, 
++     73,  83,  71,  78,   8,   0, 
++      0,   0,   0,   0,   0,   0, 
++      8,   0,   0,   0,  79,  83, 
++     71,  78,   8,   0,   0,   0, 
++      0,   0,   0,   0,   8,   0, 
++      0,   0,  83,  72,  69,  88, 
++    208,  14,   0,   0,  81,   0, 
++      5,   0, 180,   3,   0,   0, 
++    106,   8,   0,   1,  89,   0, 
++      0,   7,  70, 142,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      3,   0,   0,   0,   0,   0, 
++      0,   0,  88,   8,   0,   7, 
++     70, 126,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  68,  68, 
++      0,   0,   0,   0,   0,   0, 
++    156,   8,   0,   7,  70, 238, 
++     49,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  68,  68,   0,   0, 
++      0,   0,   0,   0,  95,   0, 
++      0,   2, 114,   0,   2,   0, 
++    104,   0,   0,   2,   5,   0, 
++      0,   0, 155,   0,   0,   4, 
++      4,   0,   0,   0,  32,   0, 
++      0,   0,   1,   0,   0,   0, 
++      1,   0,   0,  12,  50,   0, 
++     16,   0,   0,   0,   0,   0, 
++      6, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   1,   0,   0,   0, 
++      2,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     41,   0,   0,   6,  18,   0, 
++     16,   0,   1,   0,   0,   0, 
++     10,   0,   2,   0,   1,  64, 
++      0,   0,   1,   0,   0,   0, 
++     54,   0,   0,   4,  34,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,   2,   0,  80,   0, 
++      0,   9, 194,   0,  16,   0, 
++      0,   0,   0,   0,   6,   4, 
++     16,   0,   1,   0,   0,   0, 
++      6, 132,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,  60,   0, 
++      0,   7,  66,   0,  16,   0, 
++      0,   0,   0,   0,  58,   0, 
++     16,   0,   0,   0,   0,   0, 
++     42,   0,  16,   0,   0,   0, 
++      0,   0,  31,   0,   4,   3, 
++     42,   0,  16,   0,   0,   0, 
++      0,   0,  62,   0,   0,   1, 
++     21,   0,   0,   1, 138,   0, 
++      0,  11,  66,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   2,   0,   0,   0, 
++      1,  64,   0,   0,   2,   0, 
++      0,   0,  10, 128,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     41,   0,   0,   7, 130,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      4,   0,   0,   0,  35,   0, 
++      0,   9,  34,   0,  16,   0, 
++      1,   0,   0,   0,  42,   0, 
++      2,   0,  26, 128,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     26,   0,   2,   0,  35,   0, 
++      0,  11,  34,   0,  16,   0, 
++      1,   0,   0,   0,  26,   0, 
++     16,   0,   1,   0,   0,   0, 
++     10, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   0,   0,   0,   0, 
++     30,   0,   0,   9,  34,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,  16,   0,   1,   0, 
++      0,   0,  58, 128,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     85,   0,   0,   7,  34,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      4,   0,   0,   0,  31,   0, 
++      4,   3,  10,   0,  16,   0, 
++      0,   0,   0,   0,  31,   0, 
++      4,   3,  26,   0,  16,   0, 
++      0,   0,   0,   0,  42,   0, 
++      0,   9, 114,   0,  16,   0, 
++      2,   0,   0,   0, 150,   5, 
++      2,   0,   2,  64,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0,   3,   0,   0,   0, 
++      0,   0,   0,   0,  85,   0, 
++      0,  12, 194,   0,  16,   0, 
++      1,   0,   0,   0, 246, 139, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   4,   0,   0,   0, 
++      5,   0,   0,   0,  35,   0, 
++      0,   9,  34,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   2,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,  10,   0,  16,   0, 
++      2,   0,   0,   0, 139,   0, 
++      0,  14, 146,   0,  16,   0, 
++      2,   0,   0,   0,   2,  64, 
++      0,   0,  27,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  29,   0,   0,   0, 
++      2,  64,   0,   0,   4,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   6,   0,   2,   0, 
++     35,   0,   0,   9,  34,   0, 
++     16,   0,   0,   0,   0,   0, 
++     26,   0,  16,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   2,   0,   0,   0, 
++     41,   0,   0,   6,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,   2,   0,   1,  64, 
++      0,   0,  12,   0,   0,   0, 
++      1,   0,   0,   7,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,  96,   0,   0, 140,   0, 
++      0,  11,  66,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   3,   0,   0,   0, 
++      1,  64,   0,   0,  10,   0, 
++      0,   0,  10,   0,  16,   0, 
++      1,   0,   0,   0,  42,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,   0,   7,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      6,   0,   0,   0,  30,   0, 
++      0,   7, 130,   0,  16,   0, 
++      1,   0,   0,   0,  26,   0, 
++     16,   0,   2,   0,   0,   0, 
++     42,   0,  16,   0,   2,   0, 
++      0,   0, 140,   0,   0,  11, 
++     18,   0,  16,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   1,   0,   0,   0, 
++     58,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0,   0,   0,  30,   0, 
++      0,   7,  18,   0,  16,   0, 
++      2,   0,   0,   0,  10,   0, 
++     16,   0,   2,   0,   0,   0, 
++     58,   0,  16,   0,   2,   0, 
++      0,   0, 140,   0,   0,  11, 
++     18,   0,  16,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      2,   0,   0,   0,   1,  64, 
++      0,   0,   1,   0,   0,   0, 
++     10,   0,  16,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0,   0,   0, 140,   0, 
++      0,  11, 130,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   2,   0,   0,   0, 
++    140,   0,   0,  20,  50,   0, 
++     16,   0,   2,   0,   0,   0, 
++      2,  64,   0,   0,  18,   0, 
++      0,   0,  18,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++     12,   0,   0,   0,  15,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  86,   5, 
++     16,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  35,   0,   0,  12, 
++     50,   0,  16,   0,   2,   0, 
++      0,   0, 166,  10,  16,   0, 
++      1,   0,   0,   0,   2,  64, 
++      0,   0,   2,   0,   0,   0, 
++     16,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     70,   0,  16,   0,   2,   0, 
++      0,   0, 140,   0,   0,  16, 
++     50,   0,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
++      2,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,  10,   0,   0,   0, 
++     13,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    166,  10,   2,   0,  70,   0, 
++     16,   0,   2,   0,   0,   0, 
++    140,   0,   0,  10,  34,   0, 
++     16,   0,   0,   0,   0,   0, 
++      1,  64,   0,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      4,   0,   0,   0,  26,   0, 
++      2,   0,   1,  64,   0,   0, 
++      0,   0,   0,   0, 138,   0, 
++      0,   9,  66,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   3,   0,   0,   0, 
++      1,  64,   0,   0,   6,   0, 
++      0,   0,  10,   0,  16,   0, 
++      2,   0,   0,   0,   1,   0, 
++      0,   7,  66,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,   6,   0, 
++      0,   0, 140,   0,   0,  11, 
++    130,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   8,   0,   0,   0, 
++     58,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0,   0,   0,  35,   0, 
++      0,   9,  66,   0,  16,   0, 
++      1,   0,   0,   0,  42,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,  32,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  35,   0, 
++      0,   9,  66,   0,  16,   0, 
++      1,   0,   0,   0,  42,   0, 
++     16,   0,   2,   0,   0,   0, 
++      1,  64,   0,   0,   4,   0, 
++      0,   0,  42,   0,  16,   0, 
++      1,   0,   0,   0, 140,   0, 
++      0,  17,  50,   0,  16,   0, 
++      2,   0,   0,   0,   2,  64, 
++      0,   0,   6,   0,   0,   0, 
++      6,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0,   0,   3,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  86,   5,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++     16,   0,   2,   0,   0,   0, 
++    140,   0,   0,  11,  34,   0, 
++     16,   0,   0,   0,   0,   0, 
++      1,  64,   0,   0,   9,   0, 
++      0,   0,   1,  64,   0,   0, 
++      3,   0,   0,   0,  42,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,  16,   0,   2,   0, 
++      0,   0, 140,   0,   0,  11, 
++     34,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      6,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   2,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,  18,   0, 
++      0,   1, 139,   0,   0,  14, 
++    194,   0,  16,   0,   1,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  27,   0,   0,   0, 
++     29,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
++      6,   0,   2,   0,  42,   0, 
++      0,   9,  50,   0,  16,   0, 
++      2,   0,   0,   0,  86,   5, 
++      2,   0,   2,  64,   0,   0, 
++      5,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  85,   0, 
++      0,   9,  66,   0,  16,   0, 
++      2,   0,   0,   0,  42, 128, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      5,   0,   0,   0,  35,   0, 
++      0,   9,  66,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   2,   0,   0,   0, 
++     42,   0,  16,   0,   2,   0, 
++      0,   0,  42,   0,  16,   0, 
++      1,   0,   0,   0,  41,   0, 
++      0,   6,  18,   0,  16,   0, 
++      2,   0,   0,   0,  26,   0, 
++      2,   0,   1,  64,   0,   0, 
++      7,   0,   0,   0,   1,   0, 
++      0,  10,  82,   0,  16,   0, 
++      2,   0,   0,   0,   6,   0, 
++     16,   0,   2,   0,   0,   0, 
++      2,  64,   0,   0,   0,   7, 
++      0,   0,   0,   0,   0,   0, 
++      0,   8,   0,   0,   0,   0, 
++      0,   0, 140,   0,   0,  11, 
++    130,   0,  16,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      3,   0,   0,   0,   1,  64, 
++      0,   0,   5,   0,   0,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,  10,   0,  16,   0, 
++      2,   0,   0,   0, 140,   0, 
++      0,  11, 130,   0,  16,   0, 
++      2,   0,   0,   0,   1,  64, 
++      0,   0,  21,   0,   0,   0, 
++      1,  64,   0,   0,  11,   0, 
++      0,   0,  42,   0,  16,   0, 
++      1,   0,   0,   0,  58,   0, 
++     16,   0,   2,   0,   0,   0, 
++    140,   0,   0,  10,  18,   0, 
++     16,   0,   3,   0,   0,   0, 
++      1,  64,   0,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      4,   0,   0,   0,  26,   0, 
++      2,   0,   1,  64,   0,   0, 
++      0,   0,   0,   0,  30,   0, 
++      0,   7, 130,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10,   0,  16,   0,   3,   0, 
++      0,   0,  41,   0,   0,  10, 
++     98,   0,  16,   0,   3,   0, 
++      0,   0,   6,   0,  16,   0, 
++      2,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,   0, 
++      3,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++    140,   0,   0,  17,  98,   0, 
++     16,   0,   3,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0,   0,   3,   0,   0,   0, 
++      3,   0,   0,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   8,   0, 
++      0,   0,   7,   0,   0,   0, 
++      0,   0,   0,   0,   6,   0, 
++     16,   0,   1,   0,   0,   0, 
++     86,   6,  16,   0,   3,   0, 
++      0,   0, 140,   0,   0,  17, 
++     82,   0,  16,   0,   1,   0, 
++      0,   0,   2,  64,   0,   0, 
++     21,   0,   0,   0,   0,   0, 
++      0,   0,  21,   0,   0,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,  14,   0,   0,   0, 
++      0,   0,   0,   0,  13,   0, 
++      0,   0,   0,   0,   0,   0, 
++    166,  10,  16,   0,   1,   0, 
++      0,   0,  86,   6,  16,   0, 
++      3,   0,   0,   0,  35,   0, 
++      0,  12,  82,   0,  16,   0, 
++      1,   0,   0,   0,   6,   0, 
++     16,   0,   3,   0,   0,   0, 
++      2,  64,   0,   0,   8,   0, 
++      0,   0,   0,   0,   0,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0,   6,   2,  16,   0, 
++      1,   0,   0,   0, 140,   0, 
++      0,  11,  18,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,  12,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,  42,   0,  16,   0, 
++      2,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,   0,   0,   7,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   7,   0,   0,  30,   0, 
++      0,   7,  18,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,   1,   0,   0,   7, 
++     66,   0,  16,   0,   1,   0, 
++      0,   0,  26,   0,  16,   0, 
++      2,   0,   0,   0,   1,  64, 
++      0,   0,   2,   0,   0,   0, 
++     30,   0,   0,   7,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++     58,   0,  16,   0,   1,   0, 
++      0,   0,  42,   0,  16,   0, 
++      1,   0,   0,   0, 140,   0, 
++      0,  11,  66,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   2,   0,   0,   0, 
++      1,  64,   0,   0,   6,   0, 
++      0,   0,  42,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,   0, 
++     30,   0,   0,   7,  18,   0, 
++     16,   0,   1,   0,   0,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,  42,   0,  16,   0, 
++      1,   0,   0,   0, 140,   0, 
++      0,  11,  34,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   6,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      2,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++     21,   0,   0,   1,  18,   0, 
++      0,   1,  35,   0,   0,   9, 
++     18,   0,  16,   0,   1,   0, 
++      0,   0,  42,   0,   2,   0, 
++     58, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  26,   0, 
++      2,   0,  35,   0,   0,  11, 
++     34,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      1,   0,   0,   0,  42, 128, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      0,   0,   0,   0,  21,   0, 
++      0,   1,  30,   0,   0,   9, 
++     34,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,  26, 128, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  85,   0,   0,   7, 
++     34,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   4,   0,   0,   0, 
++     45,   0,   0,   8, 242,   0, 
++     16,   0,   2,   0,   0,   0, 
++     86,   5,  16,   0,   0,   0, 
++      0,   0,  70, 126,  32,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  32,   0,   0,  10, 
++    210,   0,  16,   0,   1,   0, 
++      0,   0, 166,  10,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   3,   0,   0,   0, 
++     60,   0,   0,   7, 194,   0, 
++     16,   0,   0,   0,   0,   0, 
++    166,  14,  16,   0,   1,   0, 
++      0,   0,   6,   8,  16,   0, 
++      1,   0,   0,   0,  31,   0, 
++      4,   3,  42,   0,  16,   0, 
++      0,   0,   0,   0,  41,   0, 
++      0,  10, 242,   0,  16,   0, 
++      3,   0,   0,   0,  70,  14, 
++     16,   0,   2,   0,   0,   0, 
++      2,  64,   0,   0,   8,   0, 
++      0,   0,   8,   0,   0,   0, 
++      8,   0,   0,   0,   8,   0, 
++      0,   0,   1,   0,   0,  10, 
++    242,   0,  16,   0,   3,   0, 
++      0,   0,  70,  14,  16,   0, 
++      3,   0,   0,   0,   2,  64, 
++      0,   0,   0, 255,   0, 255, 
++      0, 255,   0, 255,   0, 255, 
++      0, 255,   0, 255,   0, 255, 
++     85,   0,   0,  10, 242,   0, 
++     16,   0,   4,   0,   0,   0, 
++     70,  14,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
++      8,   0,   0,   0,   8,   0, 
++      0,   0,   8,   0,   0,   0, 
++      8,   0,   0,   0,   1,   0, 
++      0,  10, 242,   0,  16,   0, 
++      4,   0,   0,   0,  70,  14, 
++     16,   0,   4,   0,   0,   0, 
++      2,  64,   0,   0, 255,   0, 
++    255,   0, 255,   0, 255,   0, 
++    255,   0, 255,   0, 255,   0, 
++    255,   0,  30,   0,   0,   7, 
++    242,   0,  16,   0,   2,   0, 
++      0,   0,  70,  14,  16,   0, 
++      3,   0,   0,   0,  70,  14, 
++     16,   0,   4,   0,   0,   0, 
++     21,   0,   0,   1,  31,   0, 
++      4,   3,  58,   0,  16,   0, 
++      0,   0,   0,   0,  85,   0, 
++      0,  10, 242,   0,  16,   0, 
++      3,   0,   0,   0,  70,  14, 
++     16,   0,   2,   0,   0,   0, 
++      2,  64,   0,   0,  16,   0, 
++      0,   0,  16,   0,   0,   0, 
++     16,   0,   0,   0,  16,   0, 
++      0,   0, 140,   0,   0,  17, 
++    242,   0,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
++     16,   0,   0,   0,  16,   0, 
++      0,   0,  16,   0,   0,   0, 
++     16,   0,   0,   0,   2,  64, 
++      0,   0,  16,   0,   0,   0, 
++     16,   0,   0,   0,  16,   0, 
++      0,   0,  16,   0,   0,   0, 
++     70,  14,  16,   0,   2,   0, 
++      0,   0,  70,  14,  16,   0, 
++      3,   0,   0,   0,  21,   0, 
++      0,   1,  86,   0,   0,   5, 
++    242,   0,  16,   0,   2,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,  56,   0, 
++      0,  10, 242,   0,  16,   0, 
++      2,   0,   0,   0,  70,  14, 
++     16,   0,   2,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++    128,  47,   0,   0, 128,  47, 
++      0,   0, 128,  47,   0,   0, 
++    128,  47, 164,   0,   0,   8, 
++    242, 224,  33,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     86,   5,  16,   0,   1,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,  30,   0, 
++      0,   7,  18,   0,  16,   0, 
++      1,   0,   0,   0,  26,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,   1,   0, 
++      0,   0,  31,   0,   4,   3, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  54,   0,   0,   5, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++     32,   0,   0,   0,  18,   0, 
++      0,   1,  54,   0,   0,   5, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++     16,   0,   0,   0,  21,   0, 
++      0,   1,  85,   0,   0,   7, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   4,   0,   0,   0, 
++     30,   0,   0,   7,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8, 242,   0,  16,   0, 
++      2,   0,   0,   0,   6,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     31,   0,   4,   3,  42,   0, 
++     16,   0,   0,   0,   0,   0, 
++     41,   0,   0,  10, 242,   0, 
++     16,   0,   3,   0,   0,   0, 
++     70,  14,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
++      8,   0,   0,   0,   8,   0, 
++      0,   0,   8,   0,   0,   0, 
++      8,   0,   0,   0,   1,   0, 
++      0,  10, 242,   0,  16,   0, 
++      3,   0,   0,   0,  70,  14, 
++     16,   0,   3,   0,   0,   0, 
++      2,  64,   0,   0,   0, 255, 
++      0, 255,   0, 255,   0, 255, 
++      0, 255,   0, 255,   0, 255, 
++      0, 255,  85,   0,   0,  10, 
++    242,   0,  16,   0,   4,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,   2,  64, 
++      0,   0,   8,   0,   0,   0, 
++      8,   0,   0,   0,   8,   0, 
++      0,   0,   8,   0,   0,   0, 
++      1,   0,   0,  10, 242,   0, 
++     16,   0,   4,   0,   0,   0, 
++     70,  14,  16,   0,   4,   0, 
++      0,   0,   2,  64,   0,   0, 
++    255,   0, 255,   0, 255,   0, 
++    255,   0, 255,   0, 255,   0, 
++    255,   0, 255,   0,  30,   0, 
++      0,   7, 242,   0,  16,   0, 
++      2,   0,   0,   0,  70,  14, 
++     16,   0,   3,   0,   0,   0, 
++     70,  14,  16,   0,   4,   0, 
++      0,   0,  21,   0,   0,   1, 
++     31,   0,   4,   3,  58,   0, 
++     16,   0,   0,   0,   0,   0, 
++     85,   0,   0,  10, 242,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,  14,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
++     16,   0,   0,   0,  16,   0, 
++      0,   0,  16,   0,   0,   0, 
++     16,   0,   0,   0, 140,   0, 
++      0,  17, 242,   0,  16,   0, 
++      2,   0,   0,   0,   2,  64, 
++      0,   0,  16,   0,   0,   0, 
++     16,   0,   0,   0,  16,   0, 
++      0,   0,  16,   0,   0,   0, 
++      2,  64,   0,   0,  16,   0, 
++      0,   0,  16,   0,   0,   0, 
++     16,   0,   0,   0,  16,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     21,   0,   0,   1,  86,   0, 
++      0,   5, 242,   0,  16,   0, 
++      0,   0,   0,   0,  70,  14, 
++     16,   0,   2,   0,   0,   0, 
++     56,   0,   0,  10, 242,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,  14,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128,  47,   0,   0, 
++    128,  47,   0,   0, 128,  47, 
++      0,   0, 128,  47, 164,   0, 
++      0,   8, 242, 224,  33,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   6,   0,  16,   0, 
++      1,   0,   0,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     62,   0,   0,   1,  83,  84, 
++     65,  84, 148,   0,   0,   0, 
++    113,   0,   0,   0,   5,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   2,   0, 
++      0,   0,  34,   0,   0,   0, 
++     22,   0,   0,   0,   5,   0, 
++      0,   0,   8,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0
++};
+diff --git a/src/graphics/shaders/texture_load_r32g32b32a32_unorm_float.cs.xesl b/src/graphics/shaders/texture_load_r32g32b32a32_unorm_float.cs.xesl
+new file mode 100644
+index 0000000..2b3db7e
+--- /dev/null
++++ b/src/graphics/shaders/texture_load_r32g32b32a32_unorm_float.cs.xesl
+@@ -0,0 +1,63 @@
++// k_32_32_32_32 with an unsigned fraction num_format has no host equivalent
++// (there's no 32-bit UNORM in DXGI). Load it into R32G32B32A32_FLOAT instead,
++// converting each component to x / (2^32 - 1) as the Xenos texture unit does.
++// Seen in Rock Band Blitz's per-frame data textures (note highway, 3D models).
++//
++// Not built by CMake: the XeSL includes are not part of this SDK. Build the
++// header with the includes from xenia-project/xenia 0b2ffa314853
++// (src/xenia/gpu/shaders), which reproduces texture_load_128bpb_cs.h exactly:
++//   fxc /D SHADING_LANGUAGE_HLSL_XE=1 /T cs_5_1 /nologo
++//       /Vn texture_load_r32g32b32a32_unorm_float_cs
++//       /Fh bytecode/d3d12_5_1/texture_load_r32g32b32a32_unorm_float_cs.h
++//       texture_load_r32g32b32a32_unorm_float.cs.xesl
++
++#include "texture_load.xesli"
++
++array_buffer_wo_declare_xe(uint4_xe, xe_texture_load_dest, set=0, binding=0, u0,
++                           space0)
++array_buffer_declare_xe(uint4_xe, xe_texture_load_source, set=1, binding=0, t0,
++                        space0)
++
++uint4_xe XeUnorm32ToFloatBits(uint4_xe value) {
++  return float_bits_to_uint_xe(float4_xe(value) * (1.0 / 4294967295.0));
++}
++
++entry_bindings_begin_compute_xe
++  XE_TEXTURE_LOAD_PUSH_CONST_BINDING
++  entry_binding_next_xe
++  array_buffer_wo_binding_xe(uint4_xe, xe_texture_load_dest, buffer(1))
++  entry_binding_next_xe
++  array_buffer_binding_xe(uint4_xe, xe_texture_load_source, buffer(2))
++entry_bindings_end_inputs_begin_compute_xe
++  entry_in_global_thread_id_xe
++entry_inputs_end_code_begin_compute_xe
++{
++  // 1 thread = 2 blocks, as in texture_load_128bpb.
++  XeTextureLoadInfo load_info = XeTextureLoadGetInfo(pass_push_consts_xe);
++  uint3_xe block_index = in_global_thread_id_xe << uint3_xe(1u, 0u, 0u);
++  dont_flatten_xe
++  if (any(greater_than_equal_xe(block_index.xy, load_info.size_blocks.xy))) {
++    return;
++  }
++  uint block_offset_host = uint(
++      (XeTextureHostLinearOffset(int3_xe(block_index), load_info.host_pitch,
++                                 load_info.size_blocks.y, 16u) +
++       load_info.host_offset) >> 4u);
++  uint block_offset_guest =
++      XeTextureLoadGuestBlockOffset(load_info, block_index, 16u, 4u) >> 4u;
++  array_buffer_store_xe(
++      xe_texture_load_dest, block_offset_host,
++      XeUnorm32ToFloatBits(XeEndianSwap32(
++          array_buffer_load_xe(xe_texture_load_source, block_offset_guest),
++          load_info.endian_32)));
++  ++block_offset_host;
++  block_offset_guest +=
++      XeTextureLoadRightConsecutiveBlocksOffset(load_info, block_index.x, 4u) >>
++      4u;
++  array_buffer_store_xe(
++      xe_texture_load_dest, block_offset_host,
++      XeUnorm32ToFloatBits(XeEndianSwap32(
++          array_buffer_load_xe(xe_texture_load_source, block_offset_guest),
++          load_info.endian_32)));
++}
++entry_code_end_compute_xe
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp b/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
+index 765e042..c969495 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
+@@ -13,6 +13,8 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ #include <algorithm>
++#include <array>
++#include <mutex>
+ 
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -605,6 +607,53 @@ u32 XeKeysAesCbcUsingKey_entry(mapped_void obscured_key, mapped_void inp_ptr, u3
+   return X_STATUS_SUCCESS;
+ }
+ 
++// Key slots 0xE0-0xE7 are filled by the title itself (the XDK wrapper adds 0xE0
++// to an index < 8 and requires 16 bytes); Rock Band uses them to unwrap song keys.
++// The real hypervisor first deobscures the key with a console secret; that step is
++// not emulated, so titles must be handed already-deobscured keys.
++constexpr uint32_t kTitleKeyFirst = 0xE0, kTitleKeyCount = 8;
++static std::mutex title_keys_mutex;
++static std::array<std::array<uint8_t, 16>, kTitleKeyCount> title_keys;
++static std::array<bool, kTitleKeyCount> title_key_set;
++
++u32 XeKeysSetKey_entry(u32 key_num, mapped_void key_ptr, u32 key_size) {
++  uint32_t slot = key_num - kTitleKeyFirst;
++  if (slot >= kTitleKeyCount || !key_ptr || key_size != 16) {
++    REXKRNL_WARN("XeKeysSetKey({:X}, size {}) rejected", (uint32_t)key_num, (uint32_t)key_size);
++    return X_STATUS_INVALID_PARAMETER;
++  }
++  std::lock_guard lock(title_keys_mutex);
++  std::memcpy(title_keys[slot].data(), key_ptr.as<const uint8_t*>(), 16);
++  title_key_set[slot] = true;
++  return X_STATUS_SUCCESS;
++}
++
++u32 XeKeysAesCbc_entry(u32 key_num, mapped_void inp_ptr, u32 inp_size, mapped_void out_ptr,
++                       mapped_void feed_ptr, u32 encrypt) {
++  uint32_t slot = key_num - kTitleKeyFirst;
++  std::array<uint8_t, 16> key;
++  {
++    std::lock_guard lock(title_keys_mutex);
++    if (slot >= kTitleKeyCount || !title_key_set[slot]) {
++      // Console keys (fuses, keyvault) do not exist here.
++      REXKRNL_WARN("XeKeysAesCbc: key {:X} not available", (uint32_t)key_num);
++      return X_STATUS_UNSUCCESSFUL;
++    }
++    key = title_keys[slot];
++  }
++  if (!inp_ptr || !out_ptr || inp_size % 16) {
++    return X_STATUS_INVALID_PARAMETER;
++  }
++  XECRYPT_AES_STATE aes;
++  XeCryptAesKey_entry(ppc_ptr_t<XECRYPT_AES_STATE>::from_host(&aes),
++                      mapped_void::from_host(key.data()));
++  // A null feed means a zero IV that the caller does not get back.
++  uint8_t zero_feed[16] = {};
++  XeCryptAesCbc_entry(ppc_ptr_t<XECRYPT_AES_STATE>::from_host(&aes), inp_ptr, inp_size, out_ptr,
++                      feed_ptr ? feed_ptr : mapped_void::from_host(zero_feed), encrypt);
++  return X_STATUS_SUCCESS;
++}
++
+ u32 XeKeysObscureKey_entry(mapped_void input, mapped_void output) {
+   // Based on HvxKeysObscureKey
+   // Seems to encrypt input with per-console KEY_OBFUSCATION_KEY (key 0x18)
+@@ -707,14 +756,12 @@ REX_EXPORT_STUB(__imp__XeKeysSaveKeyVault);
+ REX_EXPORT_STUB(__imp__XeKeysGetStatus);
+ REX_EXPORT_STUB(__imp__XeKeysGeneratePrivateKey);
+ REX_EXPORT_STUB(__imp__XeKeysGetKeyProperties);
+-REX_EXPORT_STUB(__imp__XeKeysSetKey);
+ REX_EXPORT_STUB(__imp__XeKeysGenerateRandomKey);
+ REX_EXPORT_STUB(__imp__XeKeysGetKey);
+ REX_EXPORT_STUB(__imp__XeKeysGetDigest);
+ REX_EXPORT_STUB(__imp__XeKeysGetConsoleID);
+ REX_EXPORT_STUB(__imp__XeKeysGetConsoleType);
+ REX_EXPORT_STUB(__imp__XeKeysQwNeRsaPrvCrypt);
+-REX_EXPORT_STUB(__imp__XeKeysAesCbc);
+ REX_EXPORT_STUB(__imp__XeKeysDes2Cbc);
+ REX_EXPORT_STUB(__imp__XeKeysDesCbc);
+ REX_EXPORT_STUB(__imp__XeKeysSaveBootLoaderEx);
+@@ -803,6 +850,8 @@ REX_EXPORT(__imp__XeCryptAesCbc, rex::kernel::xboxkrnl::XeCryptAesCbc_entry)
+ REX_EXPORT(__imp__XeCryptHmacSha, rex::kernel::xboxkrnl::XeCryptHmacSha_entry)
+ REX_EXPORT(__imp__XeKeysHmacSha, rex::kernel::xboxkrnl::XeKeysHmacSha_entry)
+ REX_EXPORT(__imp__XeKeysAesCbcUsingKey, rex::kernel::xboxkrnl::XeKeysAesCbcUsingKey_entry)
++REX_EXPORT(__imp__XeKeysSetKey, rex::kernel::xboxkrnl::XeKeysSetKey_entry)
++REX_EXPORT(__imp__XeKeysAesCbc, rex::kernel::xboxkrnl::XeKeysAesCbc_entry)
+ REX_EXPORT(__imp__XeKeysObscureKey, rex::kernel::xboxkrnl::XeKeysObscureKey_entry)
+ REX_EXPORT(__imp__XeKeysHmacShaUsingKey, rex::kernel::xboxkrnl::XeKeysHmacShaUsingKey_entry)
+ REX_EXPORT(__imp__XeKeysConsolePrivateKeySign,
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..e48e9df 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -16,6 +16,8 @@
+ #include <atomic>
+ #include <string>
+ 
++#include <rex/audio/audio_driver.h>
++#include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/register_file.h>
+@@ -445,6 +447,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
+                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
+                   mapped_u32 height) {
++  rex::audio::AdvanceAudioFrameClock();  // Blitz patch 9 (--audio_frame_clock)
++  rex::chrono::Clock::AdvanceFrame();     // Blitz patch 10 (--clock_frame_lock)
+   // All of these parameters are REQUIRED.
+   assert(buffer_ptr);
+   assert(fetch_ptr);
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+index bf8252b..cc8755d 100644
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -18,6 +18,7 @@
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_provider.h>
+ 
++#include <dxgi1_6.h>
+ #include <malloc.h>
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+@@ -30,7 +31,8 @@ REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
+                     "Break on Direct3D 12 validation warnings");
+ 
+ REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
+-                     "Index of the DXGI adapter to use (-1 for any physical, -2 for WARP)")
++                     "Index of the DXGI adapter to use, high-performance first (-1 for any "
++                     "physical, -2 for WARP)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
+@@ -250,10 +252,18 @@ bool D3D12Provider::Initialize() {
+     return false;
+   }
+ 
+-  // Choose the adapter.
++  // Choose the adapter. Plain EnumAdapters1 lists the integrated GPU first on
++  // hybrid laptops, so prefer the high-performance order where DXGI has it.
++  IDXGIFactory6* dxgi_factory6 = nullptr;
++  dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6));
++  auto enum_adapter = [&](uint32_t index, IDXGIAdapter1** out) {
++    return dxgi_factory6 ? dxgi_factory6->EnumAdapterByGpuPreference(
++                               index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(out))
++                         : dxgi_factory->EnumAdapters1(index, out);
++  };
+   uint32_t adapter_index = 0;
+   IDXGIAdapter1* adapter = nullptr;
+-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
++  while (enum_adapter(adapter_index, &adapter) == S_OK) {
+     DXGI_ADAPTER_DESC1 adapter_desc;
+     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
+@@ -277,6 +287,9 @@ bool D3D12Provider::Initialize() {
+     adapter = nullptr;
+     ++adapter_index;
+   }
++  if (dxgi_factory6) {
++    dxgi_factory6->Release();
++  }
+   if (adapter == nullptr) {
+     REXLOG_ERROR(
+         "Failed to get an adapter supporting Direct3D 12 with the feature "
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index b4e045f..c0a5091 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -21,6 +21,8 @@
+ 
+ #include <imgui.h>
+ 
++REXCVAR_DEFINE_BOOL(window_hidden, false, "UI/Window",
++                    "Never show the window (for automated test runs)");
+ REXCVAR_DEFINE_INT32(window_width, 0, "UI/Window",
+                      "Startup window width in logical pixels (0 = use app default)")
+     .range(0, 8192)
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..69002b8 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -183,7 +183,10 @@ bool WindowSDL::OpenImpl() {
+   // desired state so a reopened window comes back with the state it had.
+   ApplyTextInputActiveNow();
+   ApplyCursorVisibilityNow();
+-  SDL_ShowWindow(sdl_window_);
++  // Automated test runs keep the window off screen and out of focus.
++  if (!REXCVAR_GET(window_hidden)) {
++    SDL_ShowWindow(sdl_window_);
++  }
+ 
+   // Actualize state for the common Window code. Listener dispatch is handled
+   // by Window::Open after OpenImpl returns; these only record initial state.
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..3ed8f40 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -125,8 +125,9 @@ target_include_directories(aes128 PUBLIC
+ target_compile_options(aes128 PRIVATE -w)
+ 
+ # libmspack - LZX decompression (only lzxd.c needed for XEX decompression)
+-# Uses cabextract version which has all needed headers in one place
+-set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack")
++# Use the real sources: cabextract/mspack is all git symlinks, which Windows
++# checkouts (core.symlinks=false) turn into one-line text files.
++set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/libmspack/mspack")
+ add_library(mspack STATIC
+     ${MSPACK_DIR}/lzxd.c
+ )
