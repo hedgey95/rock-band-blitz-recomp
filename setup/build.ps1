@@ -10,6 +10,7 @@ param(
   [switch]$Shortcut, [switch]$InstallTools
 )
 $ErrorActionPreference = 'Stop'
+$env:VSCMD_SKIP_SENDTELEMETRY = '1'  # no vctip.exe from the MSVC tools
 . "$PSScriptRoot\common.ps1"
 $repo = Split-Path $PSScriptRoot -Parent
 $steps = 8
@@ -41,8 +42,14 @@ function Step([string]$text) {
 function Run([string]$exe, [string[]]$arguments, [string]$cwd = $repo) {
   Add-Content -LiteralPath $log -Value "> $exe $($arguments -join ' ')"
   $quoted = ($arguments | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
-  $process = Start-Process -FilePath 'cmd.exe' -WorkingDirectory $cwd -NoNewWindow -Wait -PassThru `
-    -ArgumentList "/s /c `"`"$exe`" $quoted >> `"$log`" 2>&1`""
+  # Waits for the tool itself only: Start-Process -Wait also waits for anything
+  # it leaves behind (MSVC's vctip.exe telemetry lingers for minutes).
+  $info = New-Object System.Diagnostics.ProcessStartInfo 'cmd.exe', "/s /c `"`"$exe`" $quoted >> `"$log`" 2>&1`""
+  $info.WorkingDirectory = $cwd
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  $process = [System.Diagnostics.Process]::Start($info)
+  $process.WaitForExit()
   if ($process.ExitCode -ne 0) { throw "$(Split-Path $exe -Leaf) failed (exit $($process.ExitCode)); see $log" }
 }
 
